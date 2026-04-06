@@ -9,14 +9,15 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 try:
-    from langchain_openai import ChatOpenAI
+    from dotenv import load_dotenv
 except Exception:
-    ChatOpenAI = None
+    def load_dotenv() -> bool:  # type: ignore[no-redef]
+        return False
 
 try:
-    from openai import OpenAI
+    from huggingface_hub import InferenceClient
 except Exception:
-    OpenAI = None
+    InferenceClient = None
 
 from src.agent.prompts import ANSWER_SYSTEM_PROMPT, ROUTER_SYSTEM_PROMPT
 from src.agent.tools import build_tools
@@ -26,6 +27,9 @@ try:
     from langchain_community.chat_models import ChatOllama
 except Exception:
     ChatOllama = None
+
+
+load_dotenv()
 
 
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
@@ -127,7 +131,7 @@ def _to_chat_messages(messages: list[Any]) -> list[dict[str, str]]:
 
 
 class HuggingFaceRouterLLM:
-    """OpenAI-compatible client against HuggingFace Router chat completions."""
+    """HuggingFace Router chat client backed by HF API key."""
 
     def __init__(
         self,
@@ -137,23 +141,30 @@ class HuggingFaceRouterLLM:
         temperature: float = 0.0,
         max_tokens: int = 900,
     ) -> None:
-        if OpenAI is None:
-            raise RuntimeError("openai package is required for HuggingFace Router integration.")
+        if InferenceClient is None:
+            raise RuntimeError("huggingface_hub is required for HuggingFace Router integration.")
 
-        self.client = OpenAI(api_key=token, base_url=base_url)
+        # huggingface_hub>=1.9 does not allow model and base_url together at init.
+        if base_url:
+            self.client = InferenceClient(base_url=base_url, api_key=token)
+        else:
+            self.client = InferenceClient(model=model, api_key=token)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
 
     def invoke(self, messages: list[Any]) -> _LocalMessage:
         payload = _to_chat_messages(messages)
-        completion = self.client.chat.completions.create(
-            model=self.model,
+        completion = self.client.chat_completion(
             messages=payload,
+            model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        text = completion.choices[0].message.content if completion.choices else ""
+        text = ""
+        if getattr(completion, "choices", None):
+            message = completion.choices[0].message
+            text = getattr(message, "content", "")
         return _LocalMessage(content=str(text or ""))
 
 
@@ -195,13 +206,9 @@ class LegalContractAgent:
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     def _build_default_llm(self, model_name: str | None, temperature: float) -> Any:
-        configured_model = model_name or os.getenv("LLM_MODEL", "gpt-4o-mini")
-        if ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
-            return ChatOpenAI(model=configured_model, temperature=temperature)
-
         hf_token = os.getenv("HF_TOKEN", "").strip()
         if hf_token:
-            hf_model = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+            hf_model = model_name or os.getenv("HF_MODEL") or os.getenv("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
             hf_base_url = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
             try:
                 return HuggingFaceRouterLLM(

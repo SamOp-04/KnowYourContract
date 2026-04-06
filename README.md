@@ -11,7 +11,7 @@ Tech stack: Python 3.11, LangChain, FAISS + BM25 (RRF), FastAPI, Streamlit, RAGA
 
 ## Resume Bullet
 
-Built a Legal Contract Analyzer using Agentic RAG (LangChain, FAISS + BM25, GPT-4o-mini/Mistral) on CUAD (510 contracts); implemented hybrid retrieval, evaluated with RAGAs (faithfulness, answer relevance, context precision/recall), and deployed on AWS ECS Fargate with real-time monitoring.
+Built a Legal Contract Analyzer using Agentic RAG (LangChain, FAISS + BM25, HuggingFace Qwen/Mistral) on CUAD (510 contracts); implemented hybrid retrieval, evaluated with RAGAs (faithfulness, answer relevance, context precision/recall), and deployed on AWS ECS Fargate with real-time monitoring.
 
 ## Problem Statement
 

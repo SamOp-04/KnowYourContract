@@ -28,15 +28,24 @@ except Exception:
         pass
 
 try:
-    from langchain_openai import OpenAIEmbeddings
+    from dotenv import load_dotenv
 except Exception:
-    OpenAIEmbeddings = None
+    def load_dotenv() -> bool:  # type: ignore[no-redef]
+        return False
+
+try:
+    from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+except Exception:
+    HuggingFaceInferenceAPIEmbeddings = None
 
 from src.ingestion.chunker import DEFAULT_OUTPUT_PATH, build_chunks_from_cuad, save_chunks
 
 DEFAULT_FAISS_DIR = Path("data/processed/faiss_index")
 DEFAULT_METADATA_PATH = Path("data/processed/chunk_metadata.json")
 DEFAULT_BM25_PATH = Path("data/processed/bm25_index.pkl")
+
+
+load_dotenv()
 
 
 class HashEmbeddings(Embeddings):
@@ -64,9 +73,18 @@ class HashEmbeddings(Embeddings):
         return vector.tolist()
 
 
-def resolve_embeddings(model_name: str = "text-embedding-3-small") -> Embeddings:
-    if OpenAIEmbeddings is not None and os.getenv("OPENAI_API_KEY"):
-        return OpenAIEmbeddings(model=model_name)
+def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
+    hf_token = os.getenv("HF_TOKEN", "").strip()
+    if HuggingFaceInferenceAPIEmbeddings is not None and hf_token:
+        embedding_kwargs: dict[str, Any] = {
+            "api_key": hf_token,
+            "model_name": model_name,
+        }
+        api_url = os.getenv("HF_EMBEDDING_API_URL", "").strip()
+        if api_url:
+            embedding_kwargs["api_url"] = api_url
+        return HuggingFaceInferenceAPIEmbeddings(**embedding_kwargs)
+
     return HashEmbeddings()
 
 
@@ -87,7 +105,7 @@ def load_chunks(chunks_path: Path = DEFAULT_OUTPUT_PATH) -> list[dict[str, Any]]
 def build_faiss_index(
     chunks: list[dict[str, Any]],
     output_dir: Path = DEFAULT_FAISS_DIR,
-    model_name: str = "text-embedding-3-small",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
 ) -> Path:
     if FAISS is None:
         raise RuntimeError("langchain-community is required to build FAISS indexes.")
@@ -155,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunks", default=str(DEFAULT_OUTPUT_PATH), help="Path to chunked JSONL file")
     parser.add_argument("--faiss-dir", default=str(DEFAULT_FAISS_DIR), help="Path to save FAISS index")
     parser.add_argument("--metadata", default=str(DEFAULT_METADATA_PATH), help="Path to save chunk metadata")
-    parser.add_argument("--embedding-model", default="text-embedding-3-small", help="Embedding model id")
+    parser.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2", help="Embedding model id")
     parser.add_argument("--upload-s3", action="store_true", help="Upload FAISS artifacts to S3")
     return parser.parse_args()
 

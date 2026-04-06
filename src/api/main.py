@@ -11,11 +11,14 @@ except Exception:
         return False
 
 from src.agent.agent import LegalContractAgent
+from src.api.routes.ask import router as ask_router
+from src.api.routes.contracts import router as contracts_router
 from src.api.routes.metrics import router as metrics_router
 from src.api.routes.query import router as query_router
 from src.api.routes.upload import router as upload_router
 from src.evaluation.metrics_store import MetricsStore
 from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.pipeline.pipeline import ContractQAPipeline
 from src.retrieval.hybrid_retriever import HybridRetriever
 
 load_dotenv()
@@ -34,6 +37,7 @@ def create_app() -> FastAPI:
         metrics_store.init_db()
         app.state.metrics_store = metrics_store
         app.state.evaluator = RagasEvaluator(use_ragas=True)
+        app.state.pipeline = ContractQAPipeline(evaluator=app.state.evaluator)
 
         chunks_path = Path("data/processed/chunks.jsonl")
         faiss_dir = Path("data/processed/faiss_index")
@@ -51,7 +55,9 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(query_router)
+    app.include_router(ask_router)
     app.include_router(upload_router)
+    app.include_router(contracts_router)
     app.include_router(metrics_router)
     return app
 

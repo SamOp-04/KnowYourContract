@@ -82,6 +82,7 @@ async def query_contract(
     return QueryResponse(
         answer=result.get("answer", ""),
         citations=result.get("citations", []),
+        sources=result.get("sources", []),
         source_chunks=source_chunks,
         tool_used=result.get("tool_used", "contract_search"),
         route_reason=result.get("route_reason", ""),

@@ -15,7 +15,7 @@ except Exception:
     PdfReader = None
 
 from src.agent.agent import LegalContractAgent
-from src.api.schemas import UploadResponse
+from src.api.schemas import UploadBatchResponse, UploadItemResponse, UploadResponse
 from src.ingestion.chunker import build_splitter, chunk_contract
 from src.ingestion.embedder import build_faiss_index, build_sparse_index, save_metadata
 from src.retrieval.hybrid_retriever import HybridRetriever
@@ -66,47 +66,105 @@ def _rebuild_indexes_and_reload_agent(request: Request) -> None:
     request.app.state.agent = LegalContractAgent(hybrid_retriever=hybrid_retriever)
 
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_contract(request: Request, file: UploadFile = File(...)) -> UploadResponse:
+@router.post("/upload", response_model=UploadResponse | UploadBatchResponse)
+async def upload_contract(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] | None = File(default=None),
+) -> UploadResponse | UploadBatchResponse:
 
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    upload_items: list[UploadFile] = []
+    if file is not None:
+        upload_items.append(file)
+    if files:
+        upload_items.extend(files)
 
-    text = _extract_text(file.filename or "contract.txt", file_bytes)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from uploaded file.")
+    if not upload_items:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    base_name = Path(file.filename or "contract").stem
-    contract_id = f"{base_name}_{timestamp}"
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline is not initialized.")
 
-    RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    raw_text_path = RAW_UPLOAD_DIR / f"{contract_id}.txt"
-    raw_text_path.write_text(text, encoding="utf-8")
+    upload_results: list[UploadItemResponse] = []
+    legacy_chunks_to_append: list[dict[str, Any]] = []
 
-    splitter = build_splitter()
-    chunks = chunk_contract(
-        {
-            "contract_name": contract_id,
-            "contract_text": text,
-            "clause_type": "uploaded_contract",
-        },
-        splitter=splitter,
-    )
+    for index, upload in enumerate(upload_items, start=1):
+        file_bytes = await upload.read()
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded file is empty: {upload.filename or f'file_{index}'}",
+            )
 
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No chunks created from uploaded contract.")
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        base_name = Path(upload.filename or f"contract_{index}").stem
+        contract_id = f"{base_name}_{timestamp}"
 
-    _append_chunks(chunks)
+        try:
+            pipeline_result = await run_in_threadpool(
+                pipeline.ingest_upload,
+                upload.filename or "contract.txt",
+                file_bytes,
+                contract_id,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}: {error}",
+            ) from error
 
+        try:
+            text = _extract_text(upload.filename or "contract.txt", file_bytes)
+            if text.strip():
+                RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                raw_text_path = RAW_UPLOAD_DIR / f"{contract_id}.txt"
+                raw_text_path.write_text(text, encoding="utf-8")
+
+                splitter = build_splitter()
+                chunks = chunk_contract(
+                    {
+                        "contract_name": contract_id,
+                        "contract_text": text,
+                        "clause_type": "uploaded_contract",
+                    },
+                    splitter=splitter,
+                )
+                if chunks:
+                    legacy_chunks_to_append.extend(chunks)
+        except Exception:
+            # Ignore legacy indexing prep errors; primary pipeline indexing already succeeded.
+            pass
+
+        upload_results.append(
+            UploadItemResponse(
+                contract_id=str(pipeline_result.get("contract_id", contract_id)),
+                source_name=upload.filename or f"contract_{index}",
+                chunks_ingested=int(pipeline_result.get("chunks_ingested", 0)),
+                message=str(pipeline_result.get("message", "Contract uploaded and indexed successfully.")),
+            )
+        )
+
+    legacy_status = "Legacy FAISS/BM25 index updated for /query compatibility."
     try:
-        await run_in_threadpool(_rebuild_indexes_and_reload_agent, request)
+        if legacy_chunks_to_append:
+            _append_chunks(legacy_chunks_to_append)
+            await run_in_threadpool(_rebuild_indexes_and_reload_agent, request)
+        else:
+            legacy_status = "Legacy index update skipped: no legacy chunks were produced."
     except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Failed to update retriever indexes: {error}") from error
+        legacy_status = f"Legacy index update skipped: {error}"
 
-    return UploadResponse(
-        contract_id=contract_id,
-        chunks_ingested=len(chunks),
-        message="Contract uploaded and indexed successfully.",
+    if len(upload_results) == 1:
+        single = upload_results[0]
+        return UploadResponse(
+            contract_id=single.contract_id,
+            chunks_ingested=single.chunks_ingested,
+            message=f"{single.message} {legacy_status}",
+        )
+
+    return UploadBatchResponse(
+        uploads=upload_results,
+        total_files=len(upload_results),
+        message=f"Indexed {len(upload_results)} files. {legacy_status}",
     )

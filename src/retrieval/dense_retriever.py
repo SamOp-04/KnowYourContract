@@ -20,11 +20,20 @@ except Exception:
         pass
 
 try:
-    from langchain_openai import OpenAIEmbeddings
+    from dotenv import load_dotenv
 except Exception:
-    OpenAIEmbeddings = None
+    def load_dotenv() -> bool:  # type: ignore[no-redef]
+        return False
+
+try:
+    from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+except Exception:
+    HuggingFaceInferenceAPIEmbeddings = None
 
 DEFAULT_FAISS_DIR = Path("data/processed/faiss_index")
+
+
+load_dotenv()
 
 
 class HashEmbeddings(Embeddings):
@@ -49,9 +58,18 @@ class HashEmbeddings(Embeddings):
         return vector.tolist()
 
 
-def resolve_embeddings(model_name: str = "text-embedding-3-small") -> Embeddings:
-    if OpenAIEmbeddings is not None and os.getenv("OPENAI_API_KEY"):
-        return OpenAIEmbeddings(model=model_name)
+def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
+    hf_token = os.getenv("HF_TOKEN", "").strip()
+    if HuggingFaceInferenceAPIEmbeddings is not None and hf_token:
+        embedding_kwargs: dict[str, Any] = {
+            "api_key": hf_token,
+            "model_name": model_name,
+        }
+        api_url = os.getenv("HF_EMBEDDING_API_URL", "").strip()
+        if api_url:
+            embedding_kwargs["api_url"] = api_url
+        return HuggingFaceInferenceAPIEmbeddings(**embedding_kwargs)
+
     return HashEmbeddings()
 
 
@@ -69,7 +87,7 @@ class DenseRetriever:
     def __init__(
         self,
         index_dir: Path | str = DEFAULT_FAISS_DIR,
-        embedding_model: str = "text-embedding-3-small",
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     ) -> None:
         self.index_dir = Path(index_dir)
         self.embedding_model = embedding_model
