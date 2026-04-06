@@ -60,8 +60,6 @@ def build_contract_search_tool(hybrid_retriever: HybridRetriever) -> StructuredT
 
 
 def build_web_search_tool(max_results: int = 5) -> StructuredTool:
-    tavily_client = TavilySearchResults(max_results=max_results) if TavilySearchResults is not None else None
-
     def web_search(query: str) -> str:
         if not os.getenv("TAVILY_API_KEY"):
             return json.dumps(
@@ -78,6 +76,17 @@ def build_web_search_tool(max_results: int = 5) -> StructuredTool:
                     "tool": "web_search",
                     "results": [],
                     "warning": "Tavily client is unavailable because langchain-community is not installed.",
+                }
+            )
+
+        try:
+            tavily_client = TavilySearchResults(max_results=max_results)
+        except Exception as error:
+            return json.dumps(
+                {
+                    "tool": "web_search",
+                    "results": [],
+                    "warning": f"Tavily client could not be initialized: {error}",
                 }
             )
 

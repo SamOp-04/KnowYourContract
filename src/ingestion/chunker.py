@@ -30,6 +30,7 @@ DEFAULT_CHUNK_SIZE = 512
 DEFAULT_CHUNK_OVERLAP = 64
 DEFAULT_SEPARATORS = ["\n\n", "\n", ". ", " "]
 DEFAULT_OUTPUT_PATH = Path("data/processed/chunks.jsonl")
+DEFAULT_RAW_PATH = Path("data/raw/cuad_train.jsonl")
 APPROX_CHARS_PER_PAGE = 3200
 
 
@@ -95,13 +96,49 @@ def chunk_contract(contract: dict[str, Any], splitter: RecursiveCharacterTextSpl
     return chunks
 
 
+def load_contract_records_from_raw(
+    raw_path: Path = DEFAULT_RAW_PATH,
+    limit_contracts: int | None = None,
+) -> list[dict[str, Any]]:
+    if not raw_path.exists():
+        return []
+
+    grouped: dict[str, dict[str, Any]] = {}
+    with raw_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+
+            row = json.loads(line)
+            contract_name = str(row.get("contract_name", "")).strip()
+            contract_text = str(row.get("contract_text", "")).strip()
+            clause_type = str(row.get("clause_type", "unknown")).strip() or "unknown"
+
+            if not contract_name or not contract_text:
+                continue
+
+            if contract_name not in grouped:
+                if limit_contracts is not None and len(grouped) >= limit_contracts:
+                    continue
+
+                grouped[contract_name] = {
+                    "contract_name": contract_name,
+                    "contract_text": contract_text,
+                    "clause_type": clause_type,
+                }
+
+    return list(grouped.values())
+
+
 def build_chunks_from_cuad(split: str = "train", limit_contracts: int | None = None) -> list[dict[str, Any]]:
-    dataset = load_cuad_dataset(split=split)
+    records = load_contract_records_from_raw(limit_contracts=limit_contracts)
+    if not records:
+        dataset = load_cuad_dataset(split=split)
 
-    if limit_contracts is not None:
-        dataset = dataset.select(range(min(limit_contracts, len(dataset))))
+        if limit_contracts is not None:
+            dataset = dataset.select(range(min(limit_contracts, len(dataset))))
 
-    records = build_contract_records(dataset)
+        records = build_contract_records(dataset)
 
     splitter = build_splitter()
     all_chunks: list[dict[str, Any]] = []

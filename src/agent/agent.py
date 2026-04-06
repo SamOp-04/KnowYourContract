@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,6 +12,11 @@ try:
     from langchain_openai import ChatOpenAI
 except Exception:
     ChatOpenAI = None
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 from src.agent.prompts import ANSWER_SYSTEM_PROMPT, ROUTER_SYSTEM_PROMPT
 from src.agent.tools import build_tools
@@ -23,6 +29,132 @@ except Exception:
 
 
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+QUESTION_PATTERN = re.compile(r"Question:\s*(.*)", re.IGNORECASE | re.DOTALL)
+CHUNK_ID_PATTERN = re.compile(r"chunk_id=([^\s]+)")
+
+
+@dataclass
+class _LocalMessage:
+    content: str
+
+
+class RuleBasedLocalLLM:
+    """Lightweight local fallback used when no cloud/local chat model is configured."""
+
+    WEB_HINTS = {
+        "market",
+        "benchmark",
+        "industry",
+        "india",
+        "statute",
+        "regulation",
+        "standard",
+        "typical",
+    }
+
+    def invoke(self, messages: list[Any]) -> _LocalMessage:
+        system_prompt = str(getattr(messages[0], "content", "")).lower() if messages else ""
+        user_prompt = str(getattr(messages[-1], "content", "")) if messages else ""
+
+        question_match = QUESTION_PATTERN.search(user_prompt)
+        question = question_match.group(1).strip() if question_match else user_prompt.strip()
+
+        if "routing agent" in system_prompt:
+            lowered = question.lower()
+            tool = "web_search" if any(hint in lowered for hint in self.WEB_HINTS) else "contract_search"
+            reason = (
+                "Question asks for external legal/market context." if tool == "web_search" else "Question is clause-focused and document-groundable."
+            )
+            return _LocalMessage(content=json.dumps({"tool": tool, "reason": reason}))
+
+        context = ""
+        if "Context:\n" in user_prompt:
+            context = user_prompt.split("Context:\n", 1)[1].strip()
+
+        if not context or "No supporting context retrieved." in context:
+            return _LocalMessage(
+                content=(
+                    "I could not find enough supporting context in the indexed contract data to answer confidently. "
+                    "Please upload a more relevant contract or broaden the query."
+                )
+            )
+
+        chunk_ids = CHUNK_ID_PATTERN.findall(context)
+        citation_text = ", ".join(chunk_ids[:3]) if chunk_ids else "retrieved chunks"
+
+        context_lines = [line.strip() for line in context.splitlines() if line.strip() and not line.startswith("[")]
+        excerpt = " ".join(context_lines[:2])[:500]
+        answer = (
+            "Based on the retrieved contract clauses, the relevant terms are found in "
+            f"{citation_text}. Summary: {excerpt}"
+        )
+        return _LocalMessage(content=answer)
+
+
+def _extract_message_content(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
+
+    return str(content)
+
+
+def _to_chat_messages(messages: list[Any]) -> list[dict[str, str]]:
+    converted: list[dict[str, str]] = []
+    for message in messages:
+        message_type = str(getattr(message, "type", "")).lower()
+        if message_type == "system":
+            role = "system"
+        elif message_type in {"ai", "assistant"}:
+            role = "assistant"
+        else:
+            role = "user"
+
+        converted.append({"role": role, "content": _extract_message_content(message)})
+
+    return converted
+
+
+class HuggingFaceRouterLLM:
+    """OpenAI-compatible client against HuggingFace Router chat completions."""
+
+    def __init__(
+        self,
+        token: str,
+        model: str,
+        base_url: str = "https://router.huggingface.co/v1",
+        temperature: float = 0.0,
+        max_tokens: int = 900,
+    ) -> None:
+        if OpenAI is None:
+            raise RuntimeError("openai package is required for HuggingFace Router integration.")
+
+        self.client = OpenAI(api_key=token, base_url=base_url)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    def invoke(self, messages: list[Any]) -> _LocalMessage:
+        payload = _to_chat_messages(messages)
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=payload,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        text = completion.choices[0].message.content if completion.choices else ""
+        return _LocalMessage(content=str(text or ""))
 
 
 def _safe_json_parse(raw_text: str) -> dict[str, Any]:
@@ -67,10 +199,25 @@ class LegalContractAgent:
         if ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"):
             return ChatOpenAI(model=configured_model, temperature=temperature)
 
-        if ChatOllama is not None:
+        hf_token = os.getenv("HF_TOKEN", "").strip()
+        if hf_token:
+            hf_model = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+            hf_base_url = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
+            try:
+                return HuggingFaceRouterLLM(
+                    token=hf_token,
+                    model=hf_model,
+                    base_url=hf_base_url,
+                    temperature=temperature,
+                )
+            except Exception:
+                pass
+
+        use_ollama = os.getenv("USE_OLLAMA", "").strip().lower() in {"1", "true", "yes"}
+        if ChatOllama is not None and use_ollama:
             return ChatOllama(model="mistral:7b-instruct", temperature=temperature)
 
-        raise RuntimeError("No LLM provider configured. Set OPENAI_API_KEY or install and run Ollama.")
+        return RuleBasedLocalLLM()
 
     def route_query(self, query: str) -> dict[str, str]:
         messages = [
