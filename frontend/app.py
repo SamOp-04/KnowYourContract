@@ -8,6 +8,19 @@ import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
+QUICK_QUESTIONS = [
+    "What are the termination conditions?",
+    "How much notice is required to terminate?",
+    "What is the maximum payment under this agreement?",
+    "When must invoices be submitted?",
+    "What insurance is required?",
+    "Who owns the work products?",
+    "How are disputes resolved?",
+    "Can the consultant subcontract work?",
+    "What audit rights does the commission have?",
+    "What records must be maintained and for how long?",
+]
+
 st.set_page_config(page_title="Legal Contract Analyzer", layout="wide")
 st.title("Legal Contract Analyzer")
 st.caption("Agentic RAG over contracts with hybrid retrieval and source-grounded answers.")
@@ -16,6 +29,8 @@ if "contract_id" not in st.session_state:
     st.session_state.contract_id = None
 if "contracts" not in st.session_state:
     st.session_state.contracts = []
+if "question" not in st.session_state:
+    st.session_state.question = ""
 
 
 def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -117,10 +132,21 @@ with st.sidebar:
     st.write("Current contract scope:")
     st.code(st.session_state.contract_id or "all indexed contracts")
 
+st.markdown("### Quick Questions")
+quick_question_columns = st.columns(2)
+for index, quick_question in enumerate(QUICK_QUESTIONS):
+    if quick_question_columns[index % 2].button(
+        quick_question,
+        key=f"quick_question_{index}",
+        use_container_width=True,
+    ):
+        st.session_state.question = quick_question
+
 query = st.text_area(
     "Ask a question about clauses, obligations, risk terms, or contract comparisons:",
     height=120,
     placeholder="What is the indemnification limit in this contract?",
+    value=st.session_state.question,
 )
 
 if st.button("Analyze", type="primary", use_container_width=True):
@@ -128,33 +154,18 @@ if st.button("Analyze", type="primary", use_container_width=True):
         st.warning("Please enter a query.")
     else:
         payload = {
-            "query": query.strip(),
+            "question": query.strip(),
             "contract_id": st.session_state.contract_id,
         }
 
         try:
-            with st.spinner("Running agentic retrieval and answer generation..."):
+            with st.spinner("Running retrieval and answer generation..."):
                 result = _post_json("/ask", payload)
+
+            st.session_state.question = ""
 
             st.subheader("Answer")
             st.write(result.get("answer", "No answer generated."))
-
-            sources = result.get("sources", [])
-            st.subheader("Sources")
-            if sources:
-                for source in sources:
-                    st.markdown(f"[{source.get('index')}] {source.get('label')}")
-            else:
-                st.write("No source references returned.")
-
-            meta_col1, meta_col2 = st.columns(2)
-            with meta_col1:
-                st.metric("Tool Used", result.get("tool_used", "unknown"))
-            with meta_col2:
-                st.metric("Web Fallback", "Yes" if result.get("used_web_fallback") else "No")
-
-            st.subheader("Routing Reason")
-            st.info(result.get("route_reason", "No routing rationale available."))
 
             citations = result.get("citations", [])
             st.subheader("Citations")
@@ -163,13 +174,38 @@ if st.button("Analyze", type="primary", use_container_width=True):
             else:
                 st.write("No citations returned.")
 
+            evaluation = result.get("evaluation", {})
+            if evaluation:
+                st.subheader("Evaluation Scores")
+                score_cols = st.columns(4)
+                score_cols[0].metric("Faithfulness", round(evaluation.get("faithfulness", 0), 2))
+                score_cols[1].metric("Answer Relevance", round(evaluation.get("answer_relevance", 0), 2))
+                score_cols[2].metric("Context Precision", round(evaluation.get("context_precision", 0), 2))
+                score_cols[3].metric("Context Recall", round(evaluation.get("context_recall", 0), 2))
+                st.caption(f"Score source: {evaluation.get('score_source', 'unknown')}")
+
             st.subheader("Source Chunks")
             for index, chunk in enumerate(result.get("source_chunks", []), start=1):
-                with st.expander(f"Source {index}"):
-                    if isinstance(chunk, dict):
-                        st.json(chunk)
-                    else:
+                if isinstance(chunk, dict):
+                    metadata = chunk.get("metadata", {}) if isinstance(chunk.get("metadata", {}), dict) else {}
+                    page_number = metadata.get("page_number", "?")
+                    clause_type = metadata.get("clause_type", "")
+                    with st.expander(
+                        f"Source chunk {index} - page {page_number}"
+                        f"{f' . {clause_type}' if clause_type else ''}"
+                    ):
+                        st.write(chunk.get("text", ""))
+                else:
+                    with st.expander(f"Source chunk {index}"):
                         st.write(chunk)
+
+            meta_col1, meta_col2 = st.columns(2)
+            with meta_col1:
+                st.metric("Tool Used", result.get("tool_used", "unknown"))
+            with meta_col2:
+                st.metric("Web Fallback", "Yes" if result.get("used_web_fallback") else "No")
+
+            st.info(result.get("route_reason", ""))
         except requests.HTTPError as error:
             st.error(f"Query failed: {error.response.text}")
         except Exception as error:
