@@ -205,3 +205,21 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Legal Contract Analyzer artifacts
+data/raw/*
+!data/raw/.gitkeep
+data/raw/uploads/
+data/processed/faiss_index/
+data/processed/bm25_index.pkl
+data/processed/chunk_metadata.json
+data/processed/metrics.db
+data/eval_samples/*.jsonl
+!data/eval_samples/.gitkeep
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+terraform.tfvars
