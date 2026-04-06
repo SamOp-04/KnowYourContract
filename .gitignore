@@ -210,6 +210,9 @@ __marimo__/
 data/raw/*
 !data/raw/.gitkeep
 data/raw/uploads/
+data/processed/chroma/
+data/processed/chunks.jsonl
+data/processed/contracts_registry.json
 data/processed/faiss_index/
 data/processed/bm25_index.pkl
 data/processed/chunk_metadata.json
