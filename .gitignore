@@ -230,3 +230,10 @@ data/eval_samples/*.jsonl
 *.tfstate.*
 crash.log
 terraform.tfvars
+
+# User-requested local files
+script.py
+run_batch_eval_extreme.py
+ExtremeTest-Contract.pdf
+extreme_eval_results.md
+combined_project.py
