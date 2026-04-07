@@ -26,9 +26,16 @@ except Exception:
 
 from src.ingestion.loader import build_contract_records, load_cuad_dataset
 
-DEFAULT_CHUNK_SIZE = 512
-DEFAULT_CHUNK_OVERLAP = 64
-DEFAULT_SEPARATORS = ["\n\n", "\n", ". ", " "]
+DEFAULT_CHUNK_SIZE = 1500
+DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_SEPARATORS = [
+    "\nSECTION ",
+    "\n\d+\.\w+\.",
+    "\n\n",
+    "\n",
+    ". ",
+    " "
+]
 DEFAULT_OUTPUT_PATH = Path("data/processed/chunks.jsonl")
 DEFAULT_RAW_PATH = Path("data/raw/cuad_train.jsonl")
 APPROX_CHARS_PER_PAGE = 3200

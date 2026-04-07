@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 try:
@@ -13,6 +15,21 @@ except Exception:
     SQLALCHEMY_AVAILABLE = False
 
 DEFAULT_DATABASE_URL = "sqlite:///data/processed/metrics.db"
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+
+    raw_path = database_url[len(prefix):].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        return
+
+    try:
+        Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 
 if SQLALCHEMY_AVAILABLE:
@@ -32,7 +49,7 @@ if SQLALCHEMY_AVAILABLE:
         answer_relevance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
         context_precision: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
         context_recall: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-        created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+        created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), nullable=False)
 else:
     class Base:  # type: ignore[no-redef]
         pass
@@ -49,15 +66,16 @@ else:
             self.answer_relevance = float(kwargs.get("answer_relevance", 0.0))
             self.context_precision = float(kwargs.get("context_precision", 0.0))
             self.context_recall = float(kwargs.get("context_recall", 0.0))
-            self.created_at = kwargs.get("created_at", datetime.utcnow())
+            self.created_at = kwargs.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None))
 
 
 class MetricsStore:
-    _memory_rows: list[dict[str, Any]] = []
-
     def __init__(self, database_url: str | None = None) -> None:
+        self._memory_rows: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
         self.database_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
         if SQLALCHEMY_AVAILABLE:
+            _ensure_sqlite_parent_dir(self.database_url)
             self.engine = create_engine(self.database_url, future=True)
             self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
         else:
@@ -80,26 +98,27 @@ class MetricsStore:
                     answer_relevance=float(payload.get("answer_relevance", 0.0)),
                     context_precision=float(payload.get("context_precision", 0.0)),
                     context_recall=float(payload.get("context_recall", 0.0)),
-                    created_at=payload.get("created_at", datetime.utcnow()),
+                    created_at=payload.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None)),
                 )
                 session.add(row)
                 session.commit()
                 session.refresh(row)
                 return int(row.id)
 
-        row = {
-            "id": len(self._memory_rows) + 1,
-            "query": str(payload.get("query", "")),
-            "answer": str(payload.get("answer", "")),
-            "tool_used": str(payload.get("tool_used", "contract_search")),
-            "used_web_fallback": bool(payload.get("used_web_fallback", False)),
-            "faithfulness": float(payload.get("faithfulness", 0.0)),
-            "answer_relevance": float(payload.get("answer_relevance", 0.0)),
-            "context_precision": float(payload.get("context_precision", 0.0)),
-            "context_recall": float(payload.get("context_recall", 0.0)),
-            "created_at": payload.get("created_at", datetime.utcnow()),
-        }
-        self._memory_rows.append(row)
+        with self._lock:
+            row = {
+                "id": len(self._memory_rows) + 1,
+                "query": str(payload.get("query", "")),
+                "answer": str(payload.get("answer", "")),
+                "tool_used": str(payload.get("tool_used", "contract_search")),
+                "used_web_fallback": bool(payload.get("used_web_fallback", False)),
+                "faithfulness": float(payload.get("faithfulness", 0.0)),
+                "answer_relevance": float(payload.get("answer_relevance", 0.0)),
+                "context_precision": float(payload.get("context_precision", 0.0)),
+                "context_recall": float(payload.get("context_recall", 0.0)),
+                "created_at": payload.get("created_at", datetime.now(timezone.utc)),
+            }
+            self._memory_rows.append(row)
         return int(row["id"])
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -117,7 +136,7 @@ class MetricsStore:
         return [self._to_dict(row) for row in sorted_rows[:limit]]
 
     def get_trends(self, days: int = 7) -> list[dict[str, Any]]:
-        threshold = datetime.utcnow() - timedelta(days=days)
+        threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
         if SQLALCHEMY_AVAILABLE:
             with self.SessionLocal() as session:
                 rows = (
@@ -180,7 +199,7 @@ class MetricsStore:
     @staticmethod
     def _to_dict(row: RagasMetricLog) -> dict[str, Any]:
         if isinstance(row, dict):
-            created_at = row.get("created_at", datetime.utcnow())
+            created_at = row.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None))
             if isinstance(created_at, str):
                 created_iso = created_at
             else:

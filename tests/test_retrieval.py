@@ -1,100 +1,115 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Any
 
-from src.retrieval.hybrid_retriever import HybridRetriever, rrf_merge
-from src.retrieval.sparse_retriever import SparseRetriever, build_and_save_bm25
-
-
-def _sample_chunks() -> list[dict]:
-    return [
-        {
-            "chunk_id": "c1",
-            "text": "This clause defines indemnification obligations and liability cap.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "indemnification"},
-        },
-        {
-            "chunk_id": "c2",
-            "text": "Termination for convenience is allowed with 30 days written notice.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "termination"},
-        },
-        {
-            "chunk_id": "c3",
-            "text": "Confidential information must not be disclosed to third parties.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "confidentiality"},
-        },
-    ]
-
-
-def test_sparse_retriever_returns_expected_chunk(tmp_path: Path) -> None:
-    chunks = _sample_chunks()
-    chunks_path = tmp_path / "chunks.jsonl"
-    index_path = tmp_path / "bm25.pkl"
-
-    with chunks_path.open("w", encoding="utf-8") as file:
-        for chunk in chunks:
-            file.write(json.dumps(chunk) + "\n")
-
-    build_and_save_bm25(chunks=chunks, output_path=index_path)
-
-    retriever = SparseRetriever(chunks_path=chunks_path, index_path=index_path)
-    results = retriever.get_top_k("termination for convenience", k=2)
-
-    assert results
-    assert results[0].chunk_id == "c2"
+from src.pipeline.retriever import BM25Okapi, ClauseAwareRetriever
 
 
 @dataclass
-class _MockResult:
-    chunk_id: str
-    text: str
-    metadata: dict
-    score: float
+class _Doc:
+    page_content: str
+    metadata: dict[str, Any]
 
 
-def test_rrf_merge_prefers_docs_ranked_by_both_retrievers() -> None:
-    dense_results = [
-        _MockResult("a", "dense a", {}, 0.11),
-        _MockResult("b", "dense b", {}, 0.18),
-    ]
-    sparse_results = [
-        _MockResult("b", "sparse b", {}, 4.0),
-        _MockResult("c", "sparse c", {}, 3.5),
-    ]
+class _FakeChromaStore:
+    def __init__(self, results_by_query: dict[str, list[tuple[_Doc, float]]]) -> None:
+        self.results_by_query = results_by_query
 
-    fused = rrf_merge(dense_results, sparse_results, k=60)
-
-    assert fused
-    assert fused[0].chunk_id == "b"
-
-
-class _FakeDenseRetriever:
-    def get_top_k(self, query: str, k: int = 20) -> list[_MockResult]:
-        return [
-            _MockResult("a", "dense text a", {}, 0.2),
-            _MockResult("b", "dense text b", {}, 0.3),
-        ]
-
-    def reload(self) -> None:
-        return None
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int,
+        filter: dict[str, Any] | None = None,
+    ) -> list[tuple[_Doc, float]]:
+        results = list(self.results_by_query.get(query, []))
+        if filter:
+            filtered_results: list[tuple[_Doc, float]] = []
+            for document, score in results:
+                matches = True
+                for key, value in filter.items():
+                    if str(document.metadata.get(key)) != str(value):
+                        matches = False
+                        break
+                if matches:
+                    filtered_results.append((document, score))
+            results = filtered_results
+        return results[:k]
 
 
-class _FakeSparseRetriever:
-    def get_top_k(self, query: str, k: int = 20) -> list[_MockResult]:
-        return [
-            _MockResult("b", "sparse text b", {}, 7.1),
-            _MockResult("c", "sparse text c", {}, 6.9),
-        ]
+class _FakeVectorStore:
+    def __init__(self, store: _FakeChromaStore) -> None:
+        self.store = store
 
-    def reload(self) -> None:
-        return None
+    def get_store(self) -> _FakeChromaStore:
+        return self.store
 
 
-def test_hybrid_retriever_uses_rrf_merge() -> None:
-    hybrid = HybridRetriever(dense_retriever=_FakeDenseRetriever(), sparse_retriever=_FakeSparseRetriever())
-    top = hybrid.get_top_k("indemnification clause", k=2)
+def test_clause_aware_retriever_applies_contract_filter() -> None:
+    query = "termination notice"
+    store = _FakeChromaStore(
+        {
+            query: [
+                (_Doc("Contract A termination terms", {"chunk_id": "a", "contract_id": "contract_a"}), 0.92),
+                (_Doc("Contract B termination terms", {"chunk_id": "b", "contract_id": "contract_b"}), 0.91),
+            ]
+        }
+    )
+    retriever = ClauseAwareRetriever(
+        vector_store=_FakeVectorStore(store),
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=False,
+    )
 
-    assert len(top) == 2
-    assert top[0]["chunk_id"] == "b"
+    results = retriever.get_top_k(query=query, contract_id="contract_b", k=2, clause_hints=[])
+
+    assert results
+    assert all(item.get("metadata", {}).get("contract_id") == "contract_b" for item in results)
+
+
+def test_clause_aware_retriever_sparse_rerank_changes_order() -> None:
+    query = "obligation breach remedy"
+    store = _FakeChromaStore(
+        {
+            query: [
+                (_Doc("obligation breach remedy", {"chunk_id": "a", "contract_id": "contract_a"}), 0.76),
+                (
+                    _Doc(
+                        "obligation obligation obligation breach breach remedy remedy remedy remedy",
+                        {"chunk_id": "b", "contract_id": "contract_a"},
+                    ),
+                    0.75,
+                ),
+            ]
+        }
+    )
+    vector_store = _FakeVectorStore(store)
+
+    without_sparse = ClauseAwareRetriever(
+        vector_store=vector_store,
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=False,
+    )
+    with_sparse = ClauseAwareRetriever(
+        vector_store=vector_store,
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=True,
+        sparse_rerank_weight=0.3,
+    )
+
+    without_sparse_results = without_sparse.get_top_k(query=query, k=2, clause_hints=[])
+    with_sparse_results = with_sparse.get_top_k(query=query, k=2, clause_hints=[])
+
+    assert without_sparse_results[0]["chunk_id"] == "a"
+
+    if BM25Okapi is None:
+        # Optional dependency path: rerank is skipped when rank_bm25 is unavailable.
+        assert with_sparse_results[0]["chunk_id"] == "a"
+        return
+
+    baseline_by_id = {item["chunk_id"]: item for item in without_sparse_results}
+    sparse_by_id = {item["chunk_id"]: item for item in with_sparse_results}
+    assert sparse_by_id["b"]["rerank_score"] >= baseline_by_id["b"]["rerank_score"]

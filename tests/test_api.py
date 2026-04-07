@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +9,6 @@ from src.api.main import create_app
 from src.evaluation.metrics_store import MetricsStore
 
 
-@dataclass
 class _FakeEvaluator:
     def evaluate_single(self, question: str, answer: str, contexts: list[str], ground_truth: str = ""):
         return {
@@ -20,36 +19,49 @@ class _FakeEvaluator:
         }
 
 
-@dataclass
-class _FakeAgent:
-    def run(self, query: str, contract_id: str | None = None):
-        return {
-            "answer": "The indemnification cap is limited to direct damages.",
-            "tool_used": "contract_search",
-            "route_reason": "Query is about a contract clause.",
-            "used_web_fallback": False,
-            "citations": [
-                {
-                    "chunk_id": "c1",
-                    "contract_name": "sample_contract",
-                    "clause_type": "indemnification",
-                    "page_number": 4,
-                    "url": "",
-                }
-            ],
-            "source_chunks": [
-                {
-                    "chunk_id": "c1",
-                    "text": "Indemnification clause text",
-                    "metadata": {"contract_name": "sample_contract", "clause_type": "indemnification"},
-                }
-            ],
-        }
-
-
-@dataclass
 class _FakePipeline:
     def ask(self, question: str, contract_id: str | None = None, ground_truth: str = ""):
+        if "indemnification" in question.lower():
+            return {
+                "answer": "The indemnification cap is limited to direct damages. [1]\n\nSources:\n[1] sample_contract.pdf",
+                "tool_used": "pipeline_contract_search",
+                "route_reason": "Retrieved top contract chunks from vector search.",
+                "used_web_fallback": False,
+                "matched_clause_hints": ["indemnification"],
+                "sources": [
+                    {
+                        "index": 1,
+                        "label": "sample_contract.pdf",
+                        "contract_id": contract_id or "sample_contract",
+                    }
+                ],
+                "evaluation": {
+                    "faithfulness": 0.91,
+                    "answer_relevance": 0.9,
+                    "context_precision": 0.87,
+                    "context_recall": 0.85,
+                },
+                "citations": [
+                    {
+                        "chunk_id": "c1",
+                        "contract_name": contract_id or "sample_contract",
+                        "clause_type": "indemnification",
+                        "page_number": 4,
+                        "url": "",
+                    }
+                ],
+                "source_chunks": [
+                    {
+                        "chunk_id": "c1",
+                        "text": "Indemnification clause text",
+                        "metadata": {
+                            "contract_name": contract_id or "sample_contract",
+                            "clause_type": "indemnification",
+                        },
+                    }
+                ],
+            }
+
         return {
             "answer": "Termination for convenience requires 30 days written notice. [1]\n\nSources:\n[1] sample_contract.pdf",
             "tool_used": "pipeline_contract_search",
@@ -127,7 +139,6 @@ def client(tmp_path):
         store.init_db()
         app.state.metrics_store = store
         app.state.evaluator = _FakeEvaluator()
-        app.state.agent = _FakeAgent()
         app.state.pipeline = _FakePipeline()
         yield test_client
 
@@ -136,7 +147,7 @@ def test_query_endpoint_returns_answer(client: TestClient) -> None:
     response = client.post("/query", json={"query": "What is the indemnification cap?", "contract_id": None})
     assert response.status_code == 200
     payload = response.json()
-    assert payload["tool_used"] == "contract_search"
+    assert payload["tool_used"] == "pipeline_contract_search"
     assert "indemnification cap" in payload["answer"].lower()
 
 

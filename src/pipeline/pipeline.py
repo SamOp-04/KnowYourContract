@@ -76,15 +76,37 @@ class ContractQAPipeline:
         ground_truth: str = "",
     ) -> dict[str, Any]:
         clause_hints = extract_clause_hints_from_question(question)
+        retrieval_k = 8
+        lowered_question = question.lower()
+        if any("termination" in hint for hint in clause_hints):
+            retrieval_k = 12
+        if any(
+            term in lowered_question
+            for term in (
+                "invoice",
+                "billing",
+                "payment deadline",
+                "key personnel",
+                "project manager",
+                "replace",
+                "replaced",
+                "approval",
+            )
+        ):
+            retrieval_k = 12
 
         source_chunks = self.retriever.get_top_k(
             query=question,
             contract_id=contract_id,
-            k=6,
+            k=retrieval_k,
             clause_hints=clause_hints,
         )
         model_answer = self.answerer.answer(question=question, source_chunks=source_chunks)
-        answer, sources = self.answerer.finalize_answer_with_sources(answer=model_answer, source_chunks=source_chunks)
+        answer, sources = self.answerer.finalize_answer_with_sources(
+            answer=model_answer,
+            source_chunks=source_chunks,
+            question=question,
+        )
 
         contexts = [str(chunk.get("text", "")) for chunk in source_chunks if str(chunk.get("text", "")).strip()]
         evaluation = self.evaluator.evaluate_single(

@@ -1,77 +1,59 @@
-from __future__ import annotations
-
 import pandas as pd
 import streamlit as st
-
 from src.evaluation.metrics_store import MetricsStore
 
 FAITHFULNESS_ALERT_THRESHOLD = 0.90
 
-st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
-st.title("Legal Contract Analyzer - Monitoring Dashboard")
-st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
+def main() -> None:
+    st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
+    st.title("Legal Contract Analyzer - Monitoring Dashboard")
+    st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
 
-store = MetricsStore()
-store.init_db()
+    store = MetricsStore()
+    trends = store.get_trends(days=7)
+    if not trends:
+        st.info("No recent metrics available to display.")
+        return
 
-col_a, col_b = st.columns([2, 1])
-with col_b:
-    days = st.slider("Lookback (days)", min_value=1, max_value=30, value=7)
-    limit = st.slider("Recent records", min_value=10, max_value=200, value=50, step=10)
+    df = pd.DataFrame(trends)
+    if df.empty:
+        st.info("No data rows available in trends.")
+        return
 
-trends = store.get_trends(days=days)
-recent = store.list_recent(limit=limit)
-analytics = store.get_query_analytics()
+    df["created_at"] = pd.to_datetime(df["created_at"])
+    time_series = df.set_index("created_at")
 
-trends_df = pd.DataFrame(trends)
-recent_df = pd.DataFrame(recent)
-analytics_df = pd.DataFrame(analytics)
+    st.subheader("Quality Score Trends (Last 7 Days)")
+    metrics_to_plot = ["faithfulness", "answer_relevance", "context_precision", "context_recall"]
+    st.line_chart(time_series[metrics_to_plot])
 
-if not recent_df.empty:
-    latest = recent_df.iloc[0]
-    latest_faithfulness = float(latest.get("faithfulness", 0.0))
-    if latest_faithfulness < FAITHFULNESS_ALERT_THRESHOLD:
-        st.error(
-            "Alert: faithfulness dropped below threshold "
-            f"({latest_faithfulness:.2f} < {FAITHFULNESS_ALERT_THRESHOLD:.2f})"
-        )
+    st.subheader("Current Averages")
+    cols = st.columns(4)
+    cols[0].metric("Avg Faithfulness", f"{df['faithfulness'].mean():.2f}")
+    cols[1].metric("Avg Relevance", f"{df['answer_relevance'].mean():.2f}")
+    cols[2].metric("Avg Precision", f"{df['context_precision'].mean():.2f}")
+    cols[3].metric("Avg Recall", f"{df['context_recall'].mean():.2f}")
+
+    faithfulness_mean = df['faithfulness'].mean()
+    if faithfulness_mean < FAITHFULNESS_ALERT_THRESHOLD:
+        st.warning(f"?? Alert: Average faithfulness ({faithfulness_mean:.2f}) is below threshold ({FAITHFULNESS_ALERT_THRESHOLD}).")
+
+    st.subheader("Recent Queries")
+    recent = store.list_recent(limit=10)
+    recent_df = pd.DataFrame(recent)
+    if not recent_df.empty:
+        display_columns = ["id", "query", "tool_used", "faithfulness", "answer_relevance"]
+        st.dataframe(recent_df[display_columns], use_container_width=True, hide_index=True)
+
+    st.subheader("Query Analytics")
+    analytics = store.get_query_analytics()
+    analytics_df = pd.DataFrame(analytics)
+    if analytics_df.empty:
+        st.info("No analytics available yet.")
     else:
-        st.success(
-            "Faithfulness is healthy "
-            f"({latest_faithfulness:.2f} >= {FAITHFULNESS_ALERT_THRESHOLD:.2f})"
-        )
+        analytics_plot = analytics_df.set_index("tool_used")[['count', 'avg_faithfulness']]
+        st.bar_chart(analytics_plot)
+        st.dataframe(analytics_df, use_container_width=True, hide_index=True)
 
-with col_a:
-    st.subheader("RAGAs Trend (Last N Days)")
-    if trends_df.empty:
-        st.info("No metrics logged yet. Submit queries via API/UI to populate this chart.")
-    else:
-        trends_df["created_at"] = pd.to_datetime(trends_df["created_at"])
-        plot_df = trends_df[
-            ["created_at", "faithfulness", "answer_relevance", "context_precision", "context_recall"]
-        ].set_index("created_at")
-        st.line_chart(plot_df)
-
-st.subheader("Recent Query Metrics")
-if recent_df.empty:
-    st.info("No recent query records available.")
-else:
-    display_columns = [
-        "created_at",
-        "tool_used",
-        "used_web_fallback",
-        "faithfulness",
-        "answer_relevance",
-        "context_precision",
-        "context_recall",
-        "query",
-    ]
-    st.dataframe(recent_df[display_columns], use_container_width=True, hide_index=True)
-
-st.subheader("Query Analytics")
-if analytics_df.empty:
-    st.info("No analytics available yet.")
-else:
-    analytics_plot = analytics_df.set_index("tool_used")[["count", "avg_faithfulness"]]
-    st.bar_chart(analytics_plot)
-    st.dataframe(analytics_df, use_container_width=True, hide_index=True)
+if __name__ == "__main__":
+    main()

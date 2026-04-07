@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -38,8 +38,11 @@ class DocumentParser:
     def parse_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None) -> ParsedContract:
         if not file_bytes:
             raise ValueError("Uploaded file is empty.")
+            
+        if len(file_bytes) > 10 * 1024 * 1024:
+            raise ValueError("File exceeds 10MB maximum size limit.")
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         resolved_contract_id = contract_id or _safe_contract_id(filename=filename, timestamp=timestamp)
 
         suffix = Path(filename).suffix.lower()

@@ -21,7 +21,6 @@ except Exception:
 
 from src.agent.prompts import ANSWER_SYSTEM_PROMPT, ROUTER_SYSTEM_PROMPT
 from src.agent.tools import build_tools
-from src.retrieval.hybrid_retriever import HybridRetriever
 
 try:
     from langchain_community.chat_models import ChatOllama
@@ -195,14 +194,20 @@ class LegalContractAgent:
 
     def __init__(
         self,
-        hybrid_retriever: HybridRetriever,
+        retriever: Any | None = None,
+        clause_retriever: Any | None = None,
+        hybrid_retriever: Any | None = None,
         llm: Any | None = None,
         model_name: str | None = None,
         temperature: float = 0.0,
     ) -> None:
-        self.hybrid_retriever = hybrid_retriever
+        resolved_retriever = retriever or clause_retriever or hybrid_retriever
+        if resolved_retriever is None:
+            raise ValueError("A contract retriever is required.")
+
+        self.retriever = resolved_retriever
         self.llm = llm or self._build_default_llm(model_name=model_name, temperature=temperature)
-        self.tools = build_tools(hybrid_retriever=hybrid_retriever)
+        self.tools = build_tools(retriever=resolved_retriever)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     def _build_default_llm(self, model_name: str | None, temperature: float) -> Any:

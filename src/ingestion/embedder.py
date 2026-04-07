@@ -42,36 +42,12 @@ from src.ingestion.chunker import DEFAULT_OUTPUT_PATH, build_chunks_from_cuad, s
 
 DEFAULT_FAISS_DIR = Path("data/processed/faiss_index")
 DEFAULT_METADATA_PATH = Path("data/processed/chunk_metadata.json")
-DEFAULT_BM25_PATH = Path("data/processed/bm25_index.pkl")
 
 
 load_dotenv()
 
 
-class HashEmbeddings(Embeddings):
-    """Deterministic local fallback embeddings for offline development and tests."""
-
-    def __init__(self, dimensions: int = 384) -> None:
-        self.dimensions = dimensions
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed_text(text) for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return self._embed_text(text)
-
-    def _embed_text(self, text: str) -> list[float]:
-        vector = np.zeros(self.dimensions, dtype=np.float32)
-        for token in text.lower().split():
-            token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
-            index = int(token_hash, 16) % self.dimensions
-            vector[index] += 1.0
-
-        norm = np.linalg.norm(vector)
-        if norm > 0:
-            vector /= norm
-        return vector.tolist()
-
+from src.utils.embeddings import HashEmbeddings, get_hash_embeddings
 
 def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
     hf_token = os.getenv("HF_TOKEN", "").strip()
@@ -85,7 +61,7 @@ def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2
             embedding_kwargs["api_url"] = api_url
         return HuggingFaceInferenceAPIEmbeddings(**embedding_kwargs)
 
-    return HashEmbeddings()
+    return get_hash_embeddings()
 
 
 def load_chunks(chunks_path: Path = DEFAULT_OUTPUT_PATH) -> list[dict[str, Any]]:
@@ -141,14 +117,6 @@ def save_metadata(chunks: list[dict[str, Any]], output_path: Path = DEFAULT_META
     return output_path
 
 
-def build_sparse_index(chunks: list[dict[str, Any]], output_path: Path = DEFAULT_BM25_PATH) -> Path:
-    from src.retrieval.sparse_retriever import build_and_save_bm25
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    build_and_save_bm25(chunks=chunks, output_path=output_path)
-    return output_path
-
-
 def upload_faiss_to_s3(index_dir: Path, bucket: str, key: str, region: str) -> str:
     """Archive and upload local FAISS artifacts so ECS tasks can load them at startup."""
     if not bucket:
@@ -169,7 +137,7 @@ def upload_faiss_to_s3(index_dir: Path, bucket: str, key: str, region: str) -> s
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build FAISS and BM25 indexes from processed chunks.")
+    parser = argparse.ArgumentParser(description="Build a FAISS index from processed chunks.")
     parser.add_argument("--chunks", default=str(DEFAULT_OUTPUT_PATH), help="Path to chunked JSONL file")
     parser.add_argument("--faiss-dir", default=str(DEFAULT_FAISS_DIR), help="Path to save FAISS index")
     parser.add_argument("--metadata", default=str(DEFAULT_METADATA_PATH), help="Path to save chunk metadata")
@@ -190,11 +158,9 @@ def main() -> None:
 
     faiss_dir = build_faiss_index(chunks=chunks, output_dir=Path(args.faiss_dir), model_name=args.embedding_model)
     metadata_path = save_metadata(chunks=chunks, output_path=Path(args.metadata))
-    bm25_path = build_sparse_index(chunks=chunks)
 
     print(f"Saved FAISS index to {faiss_dir}")
     print(f"Saved metadata to {metadata_path}")
-    print(f"Saved BM25 index to {bm25_path}")
 
     if args.upload_s3:
         bucket = os.getenv("S3_FAISS_BUCKET", "")

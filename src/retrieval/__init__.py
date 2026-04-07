@@ -1,7 +1,7 @@
-"""Retrieval layer: dense, sparse, and hybrid search implementations."""
+"""Legacy retrieval package.
 
-from src.retrieval.dense_retriever import DenseRetriever
-from src.retrieval.hybrid_retriever import HybridRetriever, rrf_merge
-from src.retrieval.sparse_retriever import SparseRetriever
+Retrieval is now consolidated in src.pipeline.retriever using Chroma-backed
+ClauseAwareRetriever with optional BM25 reranking.
+"""
 
-__all__ = ["DenseRetriever", "SparseRetriever", "HybridRetriever", "rrf_merge"]
+__all__: list[str] = []

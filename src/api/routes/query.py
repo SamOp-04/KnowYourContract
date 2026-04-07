@@ -10,43 +10,27 @@ from src.api.schemas import QueryRequest, QueryResponse
 router = APIRouter(tags=["query"])
 
 
-def _extract_contexts(source_chunks: list[dict[str, Any]]) -> list[str]:
-    contexts = []
-    for chunk in source_chunks:
-        if not isinstance(chunk, dict):
-            continue
-        text = chunk.get("text") or chunk.get("content") or ""
-        if text:
-            contexts.append(str(text))
-    return contexts
-
-
-def _evaluate_and_store(
+def _store_pipeline_metrics(
     request: Request,
     query: str,
     answer: str,
-    contexts: list[str],
     tool_used: str,
     used_web_fallback: bool,
+    evaluation: dict[str, Any],
 ) -> None:
-    evaluator = request.app.state.evaluator
-    store = request.app.state.metrics_store
-
-    metrics = evaluator.evaluate_single(
-        question=query,
-        answer=answer,
-        contexts=contexts,
-        ground_truth="",
+    metrics_store = request.app.state.metrics_store
+    metrics_store.save_metric(
+        {
+            "query": query,
+            "answer": answer,
+            "tool_used": tool_used,
+            "used_web_fallback": used_web_fallback,
+            "faithfulness": float(evaluation.get("faithfulness", 0.0)),
+            "answer_relevance": float(evaluation.get("answer_relevance", 0.0)),
+            "context_precision": float(evaluation.get("context_precision", 0.0)),
+            "context_recall": float(evaluation.get("context_recall", 0.0)),
+        }
     )
-
-    payload = {
-        "query": query,
-        "answer": answer,
-        "tool_used": tool_used,
-        "used_web_fallback": used_web_fallback,
-        **metrics,
-    }
-    store.save_metric(payload)
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -55,36 +39,40 @@ async def query_contract(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> QueryResponse:
-    agent = getattr(request.app.state, "agent", None)
-    if agent is None:
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if pipeline is None:
         raise HTTPException(
             status_code=503,
-            detail="Agent is not initialized. Run ingestion and embedding pipeline first.",
+            detail="Pipeline is not initialized. Check startup logs and dependencies.",
         )
 
     try:
-        result = await run_in_threadpool(agent.run, payload.query, payload.contract_id)
+        result = await run_in_threadpool(
+            pipeline.ask,
+            payload.query,
+            payload.contract_id,
+            "",
+        )
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Query failed: {error}") from error
 
-    source_chunks = result.get("source_chunks", [])
-    contexts = _extract_contexts(source_chunks)
+    evaluation = dict(result.get("evaluation", {}))
     background_tasks.add_task(
-        _evaluate_and_store,
+        _store_pipeline_metrics,
         request,
         payload.query,
-        result.get("answer", ""),
-        contexts,
-        result.get("tool_used", "contract_search"),
+        str(result.get("answer", "")),
+        str(result.get("tool_used", "pipeline_contract_search")),
         bool(result.get("used_web_fallback", False)),
+        evaluation,
     )
 
     return QueryResponse(
-        answer=result.get("answer", ""),
-        citations=result.get("citations", []),
-        sources=result.get("sources", []),
-        source_chunks=source_chunks,
-        tool_used=result.get("tool_used", "contract_search"),
-        route_reason=result.get("route_reason", ""),
+        answer=str(result.get("answer", "")),
+        citations=list(result.get("citations", [])),
+        sources=list(result.get("sources", [])),
+        source_chunks=list(result.get("source_chunks", [])),
+        tool_used=str(result.get("tool_used", "pipeline_contract_search")),
+        route_reason=str(result.get("route_reason", "")),
         used_web_fallback=bool(result.get("used_web_fallback", False)),
     )

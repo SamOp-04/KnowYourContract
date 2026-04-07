@@ -68,8 +68,8 @@ ALL_CAPS_HEADING_PATTERN = re.compile(r"^[A-Z][A-Z0-9 ,/&()'\-]{6,}$")
 
 @dataclass
 class ClauseAwareChunker:
-    max_chunk_chars: int = 1400
-    chunk_overlap_chars: int = 180
+    max_chunk_chars: int = 1500
+    chunk_overlap_chars: int = 200
 
     def chunk_contract(self, contract_id: str, text: str) -> list[dict[str, Any]]:
         normalized = text.replace("\r\n", "\n")
