@@ -17,7 +17,8 @@ from src.api.routes.metrics import router as metrics_router
 from src.api.routes.query import router as query_router
 from src.api.routes.upload import router as upload_router
 from src.evaluation.metrics_store import MetricsStore
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
+from src.pipeline.chat_scope_registry import ChatScopeRegistry
 from src.pipeline.pipeline import ContractQAPipeline
 
 load_dotenv()
@@ -29,8 +30,9 @@ def create_app() -> FastAPI:
         metrics_store = MetricsStore()
         metrics_store.init_db()
         app.state.metrics_store = metrics_store
-        app.state.evaluator = RagasEvaluator(use_ragas=True)
+        app.state.evaluator = ContractQAEvaluator(use_llm_judge=True)
         app.state.pipeline = ContractQAPipeline(evaluator=app.state.evaluator)
+        app.state.chat_scope_registry = ChatScopeRegistry()
         app.state.agent = LegalContractAgent(clause_retriever=app.state.pipeline.retriever)
             
         yield

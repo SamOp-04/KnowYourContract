@@ -2,10 +2,23 @@ import pandas as pd
 import streamlit as st
 from src.evaluation.metrics_store import MetricsStore
 
+try:
+    from streamlit.errors import StreamlitAPIException
+except Exception:
+    StreamlitAPIException = Exception  # type: ignore[assignment]
+
 FAITHFULNESS_ALERT_THRESHOLD = 0.90
 
+
+def _safe_set_page_config() -> None:
+    try:
+        st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
+    except StreamlitAPIException:
+        # Streamlit allows set_page_config only once per run.
+        pass
+
 def main() -> None:
-    st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
+    _safe_set_page_config()
     st.title("Legal Contract Analyzer - Monitoring Dashboard")
     st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
 
@@ -36,7 +49,10 @@ def main() -> None:
 
     faithfulness_mean = df['faithfulness'].mean()
     if faithfulness_mean < FAITHFULNESS_ALERT_THRESHOLD:
-        st.warning(f"?? Alert: Average faithfulness ({faithfulness_mean:.2f}) is below threshold ({FAITHFULNESS_ALERT_THRESHOLD}).")
+        st.warning(
+            f"Alert: Average faithfulness ({faithfulness_mean:.2f}) is below threshold "
+            f"({FAITHFULNESS_ALERT_THRESHOLD:.2f})."
+        )
 
     st.subheader("Recent Queries")
     recent = store.list_recent(limit=10)

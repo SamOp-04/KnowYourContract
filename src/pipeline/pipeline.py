@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
 from src.pipeline.answerer import MistralAnswerer
 from src.pipeline.chunker import ClauseAwareChunker, extract_clause_hints_from_question
 from src.pipeline.contracts_registry import ContractRegistry
@@ -20,7 +20,7 @@ class ContractQAPipeline:
         vector_store: ContractVectorStore | None = None,
         retriever: ClauseAwareRetriever | None = None,
         answerer: MistralAnswerer | None = None,
-        evaluator: RagasEvaluator | None = None,
+        evaluator: ContractQAEvaluator | None = None,
         registry: ContractRegistry | None = None,
     ) -> None:
         self.parser = parser or DocumentParser(raw_upload_dir=Path("data/raw/uploads"))
@@ -31,7 +31,7 @@ class ContractQAPipeline:
         )
         self.retriever = retriever or ClauseAwareRetriever(vector_store=self.vector_store)
         self.answerer = answerer or MistralAnswerer()
-        self.evaluator = evaluator or RagasEvaluator(use_ragas=True)
+        self.evaluator = evaluator or ContractQAEvaluator(use_llm_judge=True)
         self.registry = registry or ContractRegistry()
 
     def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None) -> dict[str, Any]:
@@ -74,6 +74,7 @@ class ContractQAPipeline:
         question: str,
         contract_id: str | None = None,
         ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         clause_hints = extract_clause_hints_from_question(question)
         retrieval_k = 8
@@ -100,6 +101,7 @@ class ContractQAPipeline:
             contract_id=contract_id,
             k=retrieval_k,
             clause_hints=clause_hints,
+            allowed_contract_ids=allowed_contract_ids,
         )
         model_answer = self.answerer.answer(question=question, source_chunks=source_chunks)
         answer, sources = self.answerer.finalize_answer_with_sources(
@@ -122,7 +124,10 @@ class ContractQAPipeline:
             else:
                 route_reason = "Retrieved top contract chunks from vector search."
         else:
-            route_reason = "No relevant chunks were found in the indexed contract store."
+            if allowed_contract_ids is not None:
+                route_reason = "No relevant chunks were found in contracts available to this chat."
+            else:
+                route_reason = "No relevant chunks were found in the indexed contract store."
 
         return {
             "answer": answer,

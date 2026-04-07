@@ -16,6 +16,9 @@ except Exception:
     PdfReader = None
 
 
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
 @dataclass
 class ParsedContract:
     contract_id: str
@@ -38,8 +41,8 @@ class DocumentParser:
     def parse_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None) -> ParsedContract:
         if not file_bytes:
             raise ValueError("Uploaded file is empty.")
-            
-        if len(file_bytes) > 10 * 1024 * 1024:
+
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
             raise ValueError("File exceeds 10MB maximum size limit.")
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")

@@ -14,7 +14,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(project_root))
 
 from src.evaluation.metrics_store import MetricsStore
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
 from src.ingestion.loader import load_cuad_dataset, normalize_row
 
 DEFAULT_EVAL_PATH = Path("data/eval_samples/cuad_eval_samples.jsonl")
@@ -261,7 +261,7 @@ def main() -> None:
             "metrics may be conservative."
         )
 
-    evaluator = RagasEvaluator(use_ragas=True)
+    evaluator = ContractQAEvaluator(use_llm_judge=True)
     store = MetricsStore()
     store.init_db()
 

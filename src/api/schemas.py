@@ -22,6 +22,7 @@ class SourceReference(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3)
     contract_id: str | None = None
+    chat_id: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -53,6 +54,7 @@ class AskResponse(QueryResponse):
 
 
 class UploadResponse(BaseModel):
+    chat_id: str
     contract_id: str
     chunks_ingested: int
     message: str
@@ -66,6 +68,7 @@ class UploadItemResponse(BaseModel):
 
 
 class UploadBatchResponse(BaseModel):
+    chat_id: str
     uploads: list[UploadItemResponse]
     total_files: int
     message: str

@@ -126,8 +126,27 @@ def _coerce_metric(payload: dict[str, Any], key: str) -> float:
     return round(max(0.0, min(1.0, value)), 4)
 
 
+def _split_sentences(text: str) -> list[str]:
+    return [segment.strip() for segment in re.split(r"(?<=[.!?])\s+|\n+", text) if segment.strip()]
+
+
+def _sentence_support(sentence: str, contexts: list[str]) -> float:
+    sentence_tokens = tokenize(sentence)
+    if not sentence_tokens:
+        return 0.0
+
+    best = 0.0
+    for context in contexts:
+        context_tokens = tokenize(context)
+        overlap = len(sentence_tokens & context_tokens)
+        support = safe_divide(overlap, len(sentence_tokens))
+        if support > best:
+            best = support
+    return best
+
+
 @dataclass
-class OllamaLLM:
+class OllamaJudge:
     model: str = "mistral"
     endpoint: str = "http://localhost:11434/api/generate"
     timeout_seconds: float = 90.0
@@ -213,11 +232,19 @@ class EvalSample:
     ground_truth: str
 
 
-class RagasEvaluator:
-    def __init__(self, use_ragas: bool = True) -> None:
+class ContractQAEvaluator:
+    def __init__(
+        self,
+        use_llm_judge: bool = True,
+        use_ragas: bool | None = None,
+    ) -> None:
+        # Preserve backward compatibility with existing call sites using use_ragas.
+        if use_ragas is not None:
+            use_llm_judge = bool(use_ragas)
+
+        self.use_llm_judge = use_llm_judge
         self._semantic_model_name = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        self.use_ragas = use_ragas
-        self._ollama = OllamaLLM(
+        self._ollama = OllamaJudge(
             model=os.getenv("OLLAMA_MODEL", "mistral"),
             endpoint=os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"),
             timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")),
@@ -230,22 +257,23 @@ class RagasEvaluator:
         contexts: list[str],
         ground_truth: str = "",
     ) -> dict[str, Any]:
+        reference_scores = self._evaluate_reference(question, answer, contexts, ground_truth)
         fallback_reason = ""
 
-        if self.use_ragas:
+        if self.use_llm_judge:
             try:
-                ollama_scores = self._ollama.score(question, answer, contexts, ground_truth)
-                if self._metrics_are_finite(ollama_scores):
-                    ollama_scores["score_source"] = "ollama_mistral"
-                    return ollama_scores
+                llm_scores = self._ollama.score(question, answer, contexts, ground_truth)
+                if self._metrics_are_finite(llm_scores):
+                    merged = self._merge_scores(reference=reference_scores, llm=llm_scores)
+                    merged["score_source"] = "blended_llm_semantic"
+                    return merged
             except (Exception, KeyboardInterrupt) as error:
                 fallback_reason = str(error)
 
-        fallback_scores = self._evaluate_heuristic(question, answer, contexts, ground_truth)
-        fallback_scores["score_source"] = "semantic_fallback"
+        reference_scores["score_source"] = "semantic_reference"
         if fallback_reason:
-            fallback_scores["fallback_reason"] = fallback_reason[:300]
-        return fallback_scores
+            reference_scores["fallback_reason"] = fallback_reason[:300]
+        return reference_scores
 
     @staticmethod
     def _metrics_are_finite(metrics: dict[str, float]) -> bool:
@@ -260,6 +288,20 @@ class RagasEvaluator:
             except Exception:
                 return False
         return True
+
+    @staticmethod
+    def _merge_scores(reference: dict[str, float], llm: dict[str, float]) -> dict[str, float]:
+        # Faithfulness is anchored by deterministic support so ungrounded LLM scoring
+        # cannot drift too far upward.
+        blended_faithfulness = (0.65 * reference["faithfulness"]) + (0.35 * llm["faithfulness"])
+        capped_faithfulness = min(blended_faithfulness, reference["faithfulness"] + 0.15)
+
+        return {
+            "faithfulness": round(max(0.0, min(1.0, capped_faithfulness)), 4),
+            "answer_relevance": round((0.5 * reference["answer_relevance"]) + (0.5 * llm["answer_relevance"]), 4),
+            "context_precision": round((0.5 * reference["context_precision"]) + (0.5 * llm["context_precision"]), 4),
+            "context_recall": round((0.5 * reference["context_recall"]) + (0.5 * llm["context_recall"]), 4),
+        }
 
     def evaluate_batch(self, samples: list[EvalSample]) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
@@ -290,7 +332,7 @@ class RagasEvaluator:
             "context_recall": mean(float(item["context_recall"]) for item in results),
         }
 
-    def _evaluate_heuristic(
+    def _evaluate_reference(
         self,
         question: str,
         answer: str,
@@ -298,14 +340,17 @@ class RagasEvaluator:
         ground_truth: str,
     ) -> dict[str, float]:
         context_blob = "\n".join(contexts)
-        answer_sentences = [segment.strip() for segment in re.split(r"[.!?]", answer) if segment.strip()]
+        answer_sentences = _split_sentences(answer)
 
-        if answer_sentences:
-            sentence_support_scores = [
+        if answer_sentences and contexts:
+            support_scores = [_sentence_support(sentence, contexts) for sentence in answer_sentences]
+            semantic_support_scores = [
                 semantic_similarity(sentence, context_blob, model_name=self._semantic_model_name)
                 for sentence in answer_sentences
             ]
-            faithfulness_score = mean(sentence_support_scores)
+            support_faithfulness = mean(support_scores)
+            semantic_faithfulness = mean(semantic_support_scores)
+            faithfulness_score = (0.7 * support_faithfulness) + (0.3 * semantic_faithfulness)
         else:
             faithfulness_score = 0.0
 
@@ -322,8 +367,12 @@ class RagasEvaluator:
             context_recall_score = min(1.0, context_precision_score + 0.05)
 
         return {
-            "faithfulness": round(faithfulness_score, 4),
+            "faithfulness": round(max(0.0, min(1.0, faithfulness_score)), 4),
             "answer_relevance": round(answer_relevance_score, 4),
             "context_precision": round(context_precision_score, 4),
             "context_recall": round(context_recall_score, 4),
         }
+
+
+# Backward compatible alias so existing imports continue to work.
+RagasEvaluator = ContractQAEvaluator

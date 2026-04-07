@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from src.api.main import create_app
 from src.evaluation.metrics_store import MetricsStore
+from src.pipeline.chat_scope_registry import ChatScopeRegistry
 
 
 class _FakeEvaluator:
@@ -20,7 +21,36 @@ class _FakeEvaluator:
 
 
 class _FakePipeline:
-    def ask(self, question: str, contract_id: str | None = None, ground_truth: str = ""):
+    def __init__(self) -> None:
+        self._uploaded_contracts: list[dict[str, str | int]] = []
+
+    def ask(
+        self,
+        question: str,
+        contract_id: str | None = None,
+        ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
+    ):
+        if allowed_contract_ids is not None:
+            allowed = {str(item).strip() for item in allowed_contract_ids if str(item).strip()}
+            if contract_id and contract_id not in allowed:
+                return {
+                    "answer": "This contract does not contain a clause addressing that.",
+                    "tool_used": "pipeline_contract_search",
+                    "route_reason": "No relevant chunks were found in contracts available to this chat.",
+                    "used_web_fallback": False,
+                    "matched_clause_hints": [],
+                    "sources": [],
+                    "evaluation": {
+                        "faithfulness": 0.0,
+                        "answer_relevance": 0.0,
+                        "context_precision": 0.0,
+                        "context_recall": 0.0,
+                    },
+                    "citations": [],
+                    "source_chunks": [],
+                }
+
         if "indemnification" in question.lower():
             return {
                 "answer": "The indemnification cap is limited to direct damages. [1]\n\nSources:\n[1] sample_contract.pdf",
@@ -105,14 +135,24 @@ class _FakePipeline:
     def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None):
         if not file_bytes:
             raise ValueError("Uploaded file is empty")
+        resolved_contract_id = contract_id or "fake_contract_20260407000000"
+        self._uploaded_contracts.append(
+            {
+                "contract_id": resolved_contract_id,
+                "display_name": filename,
+                "source_name": filename,
+                "chunks_ingested": 3,
+                "uploaded_at": "2026-04-07T00:00:00",
+            }
+        )
         return {
-            "contract_id": contract_id or "fake_contract_20260407000000",
+            "contract_id": resolved_contract_id,
             "chunks_ingested": 3,
             "message": "Contract uploaded and indexed successfully.",
         }
 
     def list_contracts(self):
-        return [
+        static_contracts = [
             {
                 "contract_id": "sample_contract_20260407010101",
                 "display_name": "Sample Contract",
@@ -129,6 +169,8 @@ class _FakePipeline:
             },
         ]
 
+        return list(self._uploaded_contracts) + static_contracts
+
 
 @pytest.fixture
 def client(tmp_path):
@@ -140,6 +182,7 @@ def client(tmp_path):
         app.state.metrics_store = store
         app.state.evaluator = _FakeEvaluator()
         app.state.pipeline = _FakePipeline()
+        app.state.chat_scope_registry = ChatScopeRegistry(registry_path=tmp_path / "chat_scope_registry.json")
         yield test_client
 
 
@@ -205,5 +248,56 @@ def test_upload_endpoint_accepts_multiple_files(client: TestClient) -> None:
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["chat_id"]
     assert payload["total_files"] == 2
     assert len(payload["uploads"]) == 2
+
+
+def test_chat_scoped_contract_visibility_and_access(client: TestClient) -> None:
+    upload_a = client.post(
+        "/upload",
+        data={"chat_id": "chat_a"},
+        files={"file": ("chat_a_doc.txt", b"Contract text for chat A", "text/plain")},
+    )
+    assert upload_a.status_code == 200
+    contract_a = upload_a.json()["contract_id"]
+
+    upload_b = client.post(
+        "/upload",
+        data={"chat_id": "chat_b"},
+        files={"file": ("chat_b_doc.txt", b"Contract text for chat B", "text/plain")},
+    )
+    assert upload_b.status_code == 200
+    contract_b = upload_b.json()["contract_id"]
+
+    contracts_a = client.get("/contracts", params={"chat_id": "chat_a"})
+    assert contracts_a.status_code == 200
+    returned_a = {item["contract_id"] for item in contracts_a.json()["contracts"]}
+    assert contract_a in returned_a
+    assert contract_b not in returned_a
+
+    contracts_b = client.get("/contracts", params={"chat_id": "chat_b"})
+    assert contracts_b.status_code == 200
+    returned_b = {item["contract_id"] for item in contracts_b.json()["contracts"]}
+    assert contract_b in returned_b
+    assert contract_a not in returned_b
+
+    allowed_query = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "chat_id": "chat_a",
+            "contract_id": contract_a,
+        },
+    )
+    assert allowed_query.status_code == 200
+
+    blocked_query = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "chat_id": "chat_b",
+            "contract_id": contract_a,
+        },
+    )
+    assert blocked_query.status_code == 403

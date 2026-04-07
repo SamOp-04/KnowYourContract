@@ -63,22 +63,22 @@ if "sessions" not in st.session_state:
     st.session_state.sessions = {}
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
-if "contract_id" not in st.session_state:
-    st.session_state.contract_id = None
-if "contracts" not in st.session_state:
-    st.session_state.contracts = []
+if "chat_contracts" not in st.session_state:
+    st.session_state.chat_contracts = {}
+if "chat_active_contract" not in st.session_state:
+    st.session_state.chat_active_contract = {}
 
 def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=120)
     response.raise_for_status()
     return response.json()
 
-def _get_json(path: str) -> dict[str, Any]:
-    response = requests.get(f"{API_BASE_URL}{path}", timeout=60)
+def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = requests.get(f"{API_BASE_URL}{path}", params=params or {}, timeout=60)
     response.raise_for_status()
     return response.json()
 
-def _post_files(path: str, uploads: list[Any]) -> dict[str, Any]:
+def _post_files(path: str, uploads: list[Any], chat_id: str) -> dict[str, Any]:
     multipart_files = []
     for uploaded_file in uploads:
         multipart_files.append(
@@ -91,26 +91,51 @@ def _post_files(path: str, uploads: list[Any]) -> dict[str, Any]:
                 ),
             )
         )
-    response = requests.post(f"{API_BASE_URL}{path}", files=multipart_files, timeout=600)
+    response = requests.post(
+        f"{API_BASE_URL}{path}",
+        files=multipart_files,
+        data={"chat_id": chat_id},
+        timeout=600,
+    )
     response.raise_for_status()
     return response.json()
 
-def _refresh_contracts() -> None:
+def _ensure_chat_state(chat_id: str) -> None:
+    if chat_id not in st.session_state.sessions:
+        st.session_state.sessions[chat_id] = []
+    if chat_id not in st.session_state.chat_contracts:
+        st.session_state.chat_contracts[chat_id] = []
+    if chat_id not in st.session_state.chat_active_contract:
+        st.session_state.chat_active_contract[chat_id] = None
+
+
+def _refresh_contracts(chat_id: str) -> None:
+    _ensure_chat_state(chat_id)
     try:
-        payload = _get_json("/contracts")
-        st.session_state.contracts = list(payload.get("contracts", []))
+        payload = _get_json("/contracts", params={"chat_id": chat_id})
+        contracts = list(payload.get("contracts", []))
+        st.session_state.chat_contracts[chat_id] = contracts
+
+        active_contract = st.session_state.chat_active_contract.get(chat_id)
+        available_contract_ids = {
+            str(item.get("contract_id"))
+            for item in contracts
+            if item.get("contract_id")
+        }
+        if active_contract and active_contract not in available_contract_ids:
+            st.session_state.chat_active_contract[chat_id] = None
     except Exception:
-        st.session_state.contracts = []
+        st.session_state.chat_contracts[chat_id] = []
 
 def start_new_session():
     new_id = str(uuid.uuid4())
-    st.session_state.sessions[new_id] = []
+    _ensure_chat_state(new_id)
     st.session_state.current_session_id = new_id
 
 if not st.session_state.current_session_id:
     start_new_session()
 
-_refresh_contracts()
+_refresh_contracts(st.session_state.current_session_id)
 
 with st.sidebar:
     st.title("Chats")
@@ -128,40 +153,48 @@ with st.sidebar:
         button_type = "primary" if session_id == st.session_state.current_session_id else "secondary"
         if st.button(label, key=f"btn_{session_id}", use_container_width=True, type=button_type):
             st.session_state.current_session_id = session_id
+            _refresh_contracts(session_id)
             
     st.markdown("---")
     st.header("Contract Context")
     
     with st.expander("Upload & Select Contract"):
+        current_chat_id = st.session_state.current_session_id
         uploaded_files = st.file_uploader(
             "Upload contract(s) (.txt or .pdf)",
             type=["txt", "pdf"],
             accept_multiple_files=True,
+            key=f"uploader_{current_chat_id}",
         )
-        if uploaded_files and st.button("Index", type="primary"):
+        if uploaded_files and st.button("Index", type="primary", key=f"index_{current_chat_id}"):
             try:
-                payload = _post_files("/upload", uploads=list(uploaded_files))
+                payload = _post_files("/upload", uploads=list(uploaded_files), chat_id=current_chat_id)
                 uploaded_items = list(payload.get("uploads", []))
                 if uploaded_items:
-                    st.session_state.contract_id = uploaded_items[-1].get("contract_id")
+                    st.session_state.chat_active_contract[current_chat_id] = uploaded_items[-1].get("contract_id")
                 else:
-                    st.session_state.contract_id = payload.get("contract_id")
-                _refresh_contracts()
+                    st.session_state.chat_active_contract[current_chat_id] = payload.get("contract_id")
+                _refresh_contracts(current_chat_id)
                 st.success("Indexing complete!")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
 
-        contracts = st.session_state.contracts
+        contracts = st.session_state.chat_contracts.get(current_chat_id, [])
         if contracts:
             contracts_by_id = {str(item.get("contract_id")): item for item in contracts if item.get("contract_id")}
             scope_options = ["__all_contracts__"] + list(contracts_by_id.keys())
+            current_scope = st.session_state.chat_active_contract.get(current_chat_id) or "__all_contracts__"
+            if current_scope not in scope_options:
+                current_scope = "__all_contracts__"
             
             selected_scope = st.selectbox(
                 "Active Contract:",
                 options=scope_options,
-                format_func=lambda item: "All contracts" if item == "__all_contracts__" else f"{contracts_by_id.get(item, {}).get('display_name', item)}"
+                index=scope_options.index(current_scope),
+                key=f"scope_{current_chat_id}",
+                format_func=lambda item: "All contracts in this chat" if item == "__all_contracts__" else f"{contracts_by_id.get(item, {}).get('display_name', item)}"
             )
-            st.session_state.contract_id = None if selected_scope == "__all_contracts__" else selected_scope
+            st.session_state.chat_active_contract[current_chat_id] = None if selected_scope == "__all_contracts__" else selected_scope
 
 st.title("Contract Analyzer")
 
@@ -177,8 +210,8 @@ for msg in current_messages:
         if "citations" in msg and msg["citations"]:
             with st.expander("View Source Chunks"):
                 for cit in msg["citations"]:
-                    st.markdown(f"**From:** `{cit.get('source_document', 'Unknown')}`")
-                    st.write(cit.get('text', 'No text provided.'))
+                    st.markdown(f"**Contract:** {cit.get('contract_name', 'Unknown')}")
+                    st.markdown(f"**Chunk:** {cit.get('chunk_id', 'unknown_chunk')}")
                     st.divider()
         st.markdown('<div class="clearfix"></div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
@@ -208,7 +241,8 @@ if query:
         try:
             payload = {
                 "question": query,
-                "contract_id": st.session_state.contract_id,
+                "contract_id": st.session_state.chat_active_contract.get(st.session_state.current_session_id),
+                "chat_id": st.session_state.current_session_id,
             }
             result = _post_json("/ask", payload)
             answer = result.get("answer", "No answer generated.")

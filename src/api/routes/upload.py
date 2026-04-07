@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from src.api.schemas import UploadBatchResponse, UploadItemResponse, UploadResponse
@@ -15,6 +16,7 @@ async def upload_contract(
     request: Request,
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] | None = File(default=None),
+    chat_id: str | None = Form(default=None),
 ) -> UploadResponse | UploadBatchResponse:
 
     upload_items: list[UploadFile] = []
@@ -29,6 +31,12 @@ async def upload_contract(
     pipeline = getattr(request.app.state, "pipeline", None)
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline is not initialized.")
+
+    chat_scope_registry = getattr(request.app.state, "chat_scope_registry", None)
+    if chat_scope_registry is None:
+        raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
+
+    resolved_chat_id = str(chat_id or "").strip() or str(uuid.uuid4())
 
     upload_results: list[UploadItemResponse] = []
 
@@ -75,15 +83,23 @@ async def upload_contract(
             )
         )
 
+    await run_in_threadpool(
+        chat_scope_registry.add_contracts,
+        resolved_chat_id,
+        [item.contract_id for item in upload_results],
+    )
+
     if len(upload_results) == 1:
         single = upload_results[0]
         return UploadResponse(
+            chat_id=resolved_chat_id,
             contract_id=single.contract_id,
             chunks_ingested=single.chunks_ingested,
             message=single.message,
         )
 
     return UploadBatchResponse(
+        chat_id=resolved_chat_id,
         uploads=upload_results,
         total_files=len(upload_results),
         message=f"Indexed {len(upload_results)} files using the unified Chroma pipeline.",

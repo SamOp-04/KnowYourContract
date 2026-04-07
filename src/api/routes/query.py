@@ -46,12 +46,23 @@ async def query_contract(
             detail="Pipeline is not initialized. Check startup logs and dependencies.",
         )
 
+    allowed_contract_ids: list[str] | None = None
+    if payload.chat_id:
+        chat_scope_registry = getattr(request.app.state, "chat_scope_registry", None)
+        if chat_scope_registry is None:
+            raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
+
+        allowed_contract_ids = await run_in_threadpool(chat_scope_registry.list_contract_ids, payload.chat_id)
+        if payload.contract_id and payload.contract_id not in set(allowed_contract_ids):
+            raise HTTPException(status_code=403, detail="Contract is not accessible from this chat.")
+
     try:
         result = await run_in_threadpool(
             pipeline.ask,
             payload.query,
             payload.contract_id,
             "",
+            allowed_contract_ids,
         )
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Query failed: {error}") from error

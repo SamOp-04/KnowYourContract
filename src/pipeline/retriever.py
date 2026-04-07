@@ -48,16 +48,41 @@ class ClauseAwareRetriever:
         contract_id: str | None = None,
         k: int | None = None,
         clause_hints: list[str] | None = None,
+        allowed_contract_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         resolved_k = max(1, int(k or self.default_k))
         hints = clause_hints or extract_clause_hints_from_question(query)
+        if allowed_contract_ids is None:
+            normalized_allowed_contract_ids: list[str] = []
+        else:
+            normalized_allowed_contract_ids = _normalize_contract_ids(allowed_contract_ids)
+            if not normalized_allowed_contract_ids:
+                return []
+
+        allowed_set = set(normalized_allowed_contract_ids)
+
+        if contract_id and allowed_set and contract_id not in allowed_set:
+            return []
+
         where_filter = {"contract_id": contract_id} if contract_id else None
 
         search_k = max(resolved_k, self.candidate_k)
-        raw_results = list(self._similarity_search(query=query, k=search_k, where=where_filter))
+        raw_results = self._scoped_similarity_search(
+            query=query,
+            k=search_k,
+            where=where_filter,
+            allowed_contract_ids=normalized_allowed_contract_ids,
+        )
 
         for expanded_query in _build_expanded_queries(query=query, hints=hints):
-            raw_results.extend(self._similarity_search(query=expanded_query, k=max(resolved_k * 2, 12), where=where_filter))
+            raw_results.extend(
+                self._scoped_similarity_search(
+                    query=expanded_query,
+                    k=max(resolved_k * 2, 12),
+                    where=where_filter,
+                    allowed_contract_ids=normalized_allowed_contract_ids,
+                )
+            )
 
         reranked_by_chunk_id: dict[str, RetrievedChunk] = {}
         for index, (document, raw_score) in enumerate(raw_results, start=1):
@@ -100,6 +125,13 @@ class ClauseAwareRetriever:
 
         reranked = list(reranked_by_chunk_id.values())
 
+        if allowed_set:
+            reranked = [
+                item
+                for item in reranked
+                if str(item.metadata.get("contract_id", item.metadata.get("contract_name", ""))).strip() in allowed_set
+            ]
+
         if self.enable_sparse_rerank:
             reranked = _apply_sparse_rerank(
                 reranked,
@@ -119,6 +151,32 @@ class ClauseAwareRetriever:
             return [asdict(item) for item in reranked[:resolved_k]]
 
         return [asdict(item) for item in reranked[:resolved_k]]
+
+    def _scoped_similarity_search(
+        self,
+        query: str,
+        k: int,
+        where: dict[str, Any] | None,
+        allowed_contract_ids: list[str] | None,
+    ) -> list[tuple[Any, float | None]]:
+        if where:
+            return list(self._similarity_search(query=query, k=k, where=where))
+
+        if not allowed_contract_ids:
+            return list(self._similarity_search(query=query, k=k, where=None))
+
+        per_contract_k = max(4, min(k, (k // max(1, len(allowed_contract_ids))) + 2))
+        scoped_results: list[tuple[Any, float | None]] = []
+        for contract_id in allowed_contract_ids:
+            scoped_results.extend(
+                self._similarity_search(
+                    query=query,
+                    k=per_contract_k,
+                    where={"contract_id": contract_id},
+                )
+            )
+
+        return scoped_results
 
     def _similarity_search(
         self,
@@ -173,6 +231,22 @@ def _normalize_similarity(raw_score: float | None) -> float:
         return 1.0 / (1.0 + value)
 
     return 0.0
+
+
+def _normalize_contract_ids(contract_ids: list[str] | None) -> list[str]:
+    if not contract_ids:
+        return []
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for contract_id in contract_ids:
+        normalized = str(contract_id or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+
+    return output
 
 
 def _prioritize_for_clause_hints(results: list[RetrievedChunk], hints: list[str]) -> list[RetrievedChunk]:
