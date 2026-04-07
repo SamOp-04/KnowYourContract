@@ -10,6 +10,13 @@ resource "aws_security_group" "alb_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -57,8 +64,41 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+resource "aws_lb_listener" "https" {
+  count = var.acm_certificate_arn == "" ? 0 : 1
+
+  load_balancer_arn = aws_lb.main.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.acm_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api_tg.arn
+  }
+}
+
 resource "aws_lb_listener_rule" "dashboard_rule" {
   listener_arn = aws_lb_listener.http.arn
+  priority     = 10
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.dashboard_tg.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/dashboard/*"]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "dashboard_https_rule" {
+  count = var.acm_certificate_arn == "" ? 0 : 1
+
+  listener_arn = aws_lb_listener.https[0].arn
   priority     = 10
 
   action {

@@ -186,30 +186,45 @@ class ClauseAwareRetriever:
     ) -> list[tuple[Any, float | None]]:
         store = self.vector_store.get_store()
 
+        if where:
+            filter_variants: list[dict[str, Any] | None] = [
+                where,
+                {key: {"$eq": value} for key, value in where.items()},
+            ]
+        else:
+            filter_variants = [None]
+
         if hasattr(store, "similarity_search_with_score"):
-            try:
-                kwargs = {"query": query, "k": k}
-                if where:
-                    kwargs["filter"] = where
-                return list(store.similarity_search_with_score(**kwargs))
-            except Exception:
-                pass
+            for filter_variant in filter_variants:
+                try:
+                    kwargs = {"query": query, "k": k}
+                    if filter_variant is not None:
+                        kwargs["filter"] = filter_variant
+                    return list(store.similarity_search_with_score(**kwargs))
+                except Exception:
+                    continue
 
         if hasattr(store, "similarity_search_with_relevance_scores"):
+            for filter_variant in filter_variants:
+                try:
+                    kwargs = {"query": query, "k": k}
+                    if filter_variant is not None:
+                        kwargs["filter"] = filter_variant
+                    return list(store.similarity_search_with_relevance_scores(**kwargs))
+                except Exception:
+                    continue
+
+        for filter_variant in filter_variants:
             try:
                 kwargs = {"query": query, "k": k}
-                if where:
-                    kwargs["filter"] = where
-                return list(store.similarity_search_with_relevance_scores(**kwargs))
+                if filter_variant is not None:
+                    kwargs["filter"] = filter_variant
+                documents = list(store.similarity_search(**kwargs))
+                return [(document, None) for document in documents]
             except Exception:
-                pass
+                continue
 
-        kwargs = {"query": query, "k": k}
-        if where:
-            kwargs["filter"] = where
-
-        documents = list(store.similarity_search(**kwargs))
-        return [(document, None) for document in documents]
+        return []
 
 
 def _normalize_similarity(raw_score: float | None) -> float:
@@ -468,43 +483,45 @@ def _apply_sparse_rerank(results: list[RetrievedChunk], query: str, weight: floa
     if not results or BM25Okapi is None:
         return results
 
+    reranked_results = [RetrievedChunk(**asdict(item)) for item in results]
+
     query_tokens = _tokenize_for_sparse(query)
     if not query_tokens:
-        return results
+        return reranked_results
 
     tokenized_corpus: list[list[str]] = []
-    for item in results:
+    for item in reranked_results:
         section_heading = str(item.metadata.get("section_heading", ""))
         tokenized_corpus.append(_tokenize_for_sparse(f"{item.text}\n{section_heading}"))
 
     if not any(tokenized_corpus):
-        return results
+        return reranked_results
 
     try:
         bm25 = BM25Okapi(tokenized_corpus)
         sparse_scores = bm25.get_scores(query_tokens)
     except Exception:
-        return results
+        return reranked_results
 
-    if len(sparse_scores) != len(results):
-        return results
+    if len(sparse_scores) != len(reranked_results):
+        return reranked_results
 
     positive_scores = [float(score) for score in sparse_scores if float(score) > 0.0]
     if not positive_scores:
-        return results
+        return reranked_results
 
     max_positive = max(positive_scores)
     if max_positive <= 0.0:
-        return results
+        return reranked_results
 
-    for index, item in enumerate(results):
+    for index, item in enumerate(reranked_results):
         normalized_sparse = max(0.0, float(sparse_scores[index])) / max_positive
         if normalized_sparse <= 0.0:
             continue
         sparse_bonus = min(0.25, normalized_sparse * weight)
         item.rerank_score = round(min(1.0, max(0.0, item.rerank_score + sparse_bonus)), 4)
 
-    return results
+    return reranked_results
 
 
 def _inject_invoice_deadline_evidence(results: list[RetrievedChunk]) -> list[RetrievedChunk]:

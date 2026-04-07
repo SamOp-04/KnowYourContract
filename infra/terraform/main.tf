@@ -40,6 +40,24 @@ resource "aws_secretsmanager_secret_version" "tavily_secret_value" {
   secret_string = var.tavily_api_key
 }
 
+resource "aws_secretsmanager_secret" "api_auth_secret" {
+  name = "${var.project_name}/api-auth"
+}
+
+resource "aws_secretsmanager_secret_version" "api_auth_secret_value" {
+  secret_id     = aws_secretsmanager_secret.api_auth_secret.id
+  secret_string = var.api_auth_token
+}
+
+resource "aws_secretsmanager_secret" "hf_token_secret" {
+  name = "${var.project_name}/hf-token"
+}
+
+resource "aws_secretsmanager_secret_version" "hf_token_secret_value" {
+  secret_id     = aws_secretsmanager_secret.hf_token_secret.id
+  secret_string = var.hf_token
+}
+
 resource "aws_security_group" "ecs_service_sg" {
   name        = "${var.project_name}-ecs-service-sg"
   description = "Allow traffic from ALB to ECS services"
@@ -122,6 +140,26 @@ resource "aws_ecs_task_definition" "api_task" {
         {
           name  = "S3_FAISS_BUCKET"
           value = aws_s3_bucket.faiss_bucket.bucket
+        },
+        {
+          name  = "HF_MODEL"
+          value = var.hf_model
+        },
+        {
+          name  = "HF_BASE_URL"
+          value = var.hf_base_url
+        },
+        {
+          name  = "REGISTRY_BACKEND"
+          value = var.registry_backend
+        },
+        {
+          name  = "ARTIFACT_STORE_BACKEND"
+          value = var.artifact_store_backend
+        },
+        {
+          name  = "VECTOR_ARTIFACT_SYNC_INTERVAL_SECONDS"
+          value = tostring(var.vector_artifact_sync_interval_seconds)
         }
       ]
       secrets = [
@@ -132,6 +170,14 @@ resource "aws_ecs_task_definition" "api_task" {
         {
           name      = "TAVILY_API_KEY"
           valueFrom = aws_secretsmanager_secret.tavily_secret.arn
+        },
+        {
+          name      = "API_AUTH_TOKEN"
+          valueFrom = aws_secretsmanager_secret.api_auth_secret.arn
+        },
+        {
+          name      = "HF_TOKEN"
+          valueFrom = aws_secretsmanager_secret.hf_token_secret.arn
         }
       ]
       logConfiguration = {
@@ -159,7 +205,7 @@ resource "aws_ecs_task_definition" "dashboard_task" {
       name      = "dashboard"
       image     = "${aws_ecr_repository.dashboard_repo.repository_url}:${var.image_tag}"
       essential = true
-      command   = ["streamlit", "run", "src/monitoring/dashboard.py", "--server.port", "8502", "--server.address", "0.0.0.0"]
+      command   = ["streamlit", "run", "src/monitoring/dashboard.py", "--server.port", "8502", "--server.address", "0.0.0.0", "--server.baseUrlPath", "/dashboard"]
       portMappings = [
         {
           containerPort = 8502

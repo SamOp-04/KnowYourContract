@@ -5,6 +5,7 @@ from typing import Any
 
 from src.evaluation.ragas_evaluator import ContractQAEvaluator
 from src.pipeline.answerer import MistralAnswerer
+from src.pipeline.artifact_store import ContractArtifactStore
 from src.pipeline.chunker import ClauseAwareChunker, extract_clause_hints_from_question
 from src.pipeline.contracts_registry import ContractRegistry
 from src.pipeline.embedder import ContractVectorStore
@@ -22,13 +23,21 @@ class ContractQAPipeline:
         answerer: MistralAnswerer | None = None,
         evaluator: ContractQAEvaluator | None = None,
         registry: ContractRegistry | None = None,
+        artifact_store: ContractArtifactStore | None = None,
     ) -> None:
+        self.artifact_store = artifact_store or ContractArtifactStore()
         self.parser = parser or DocumentParser(raw_upload_dir=Path("data/raw/uploads"))
         self.chunker = chunker or ClauseAwareChunker()
         self.vector_store = vector_store or ContractVectorStore(
             persist_directory=Path("data/processed/chroma"),
             collection_name="contracts",
+            artifact_store=self.artifact_store,
         )
+        if getattr(self.vector_store, "artifact_store", None) is None:
+            try:
+                self.vector_store.artifact_store = self.artifact_store
+            except Exception:
+                pass
         self.retriever = retriever or ClauseAwareRetriever(vector_store=self.vector_store)
         self.answerer = answerer or MistralAnswerer()
         self.evaluator = evaluator or ContractQAEvaluator(use_llm_judge=True)
@@ -41,6 +50,13 @@ class ContractQAPipeline:
             contract_id=contract_id,
         )
 
+        self.artifact_store.upsert_contract_text(
+            contract_id=parsed.contract_id,
+            source_name=parsed.source_name,
+            raw_text=parsed.text,
+            raw_text_path=str(parsed.raw_text_path),
+        )
+
         chunks = self.chunker.chunk_contract(contract_id=parsed.contract_id, text=parsed.text)
         if not chunks:
             raise ValueError("No chunks created from uploaded contract.")
@@ -51,6 +67,7 @@ class ContractQAPipeline:
             metadata.setdefault("contract_name", parsed.contract_id)
             metadata["source_name"] = parsed.source_name
             metadata["raw_text_path"] = str(parsed.raw_text_path)
+            metadata["raw_text_ref"] = f"db://uploaded_contract_texts/{parsed.contract_id}"
             chunk["metadata"] = metadata
 
         ingested = self.vector_store.index_chunks(chunks)

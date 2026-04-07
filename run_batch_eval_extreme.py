@@ -1,6 +1,12 @@
-﻿import requests
-import json
+﻿import os
 import time
+import uuid
+
+import requests
+
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
+EVAL_CHAT_ID = os.getenv("EXTREME_EVAL_CHAT_ID", "extreme_eval_chat")
 
 QUESTIONS = [
     "What are all the hourly rate tiers for Key Personnel and at what hour thresholds do they change?",
@@ -35,30 +41,57 @@ QUESTIONS = [
     "Who must approve Change Orders exceeding $50,000?"
 ]
 
-def get_latest_extreme_contract():
+def get_latest_extreme_contract(session: "requests.Session", chat_id: str) -> str | None:
     try:
-        res = requests.get("http://localhost:8000/contracts")
+        res = session.get(f"{API_BASE_URL}/contracts", params={"chat_id": chat_id}, timeout=60)
+        res.raise_for_status()
         contracts = res.json().get("contracts", [])
         for c in reversed(contracts):
-            if "ExtremeTest-Contract" in c.get("contract_id", "") or "ExtremeTest" in c.get("display_name", ""):
+            contract_id = str(c.get("contract_id", ""))
+            display_name = str(c.get("display_name", ""))
+            source_name = str(c.get("source_name", ""))
+            haystack = f"{contract_id} {display_name} {source_name}".lower()
+            if "extremetest" in haystack or "extreme-test" in haystack:
                 return c["contract_id"]
     except Exception as e:
         print(f"Error fetching contracts: {e}")
     return None
 
+
+def upload_extreme_contract(session: "requests.Session", chat_id: str) -> str | None:
+    print("Uploading ExtremeTest-Contract.pdf...")
+    try:
+        with open("ExtremeTest-Contract.pdf", "rb") as file_handle:
+            response = session.post(
+                f"{API_BASE_URL}/upload",
+                data={"chat_id": chat_id},
+                files={"file": ("ExtremeTest-Contract.pdf", file_handle, "application/pdf")},
+                timeout=300,
+            )
+        response.raise_for_status()
+        payload = response.json()
+
+        contract_id = payload.get("contract_id")
+        if contract_id:
+            return str(contract_id)
+
+        uploads = payload.get("uploads", [])
+        if isinstance(uploads, list) and uploads:
+            return str(uploads[0].get("contract_id", "")) or None
+    except Exception as e:
+        print(f"Failed to upload: {e}")
+
+    return None
+
 def main():
-    contract_id = get_latest_extreme_contract()
+    chat_id = str(EVAL_CHAT_ID or "").strip() or f"extreme_eval_{uuid.uuid4().hex[:8]}"
+    session = requests.Session()
+    if API_AUTH_TOKEN:
+        session.headers.update({"x-api-key": API_AUTH_TOKEN})
+
+    contract_id = get_latest_extreme_contract(session=session, chat_id=chat_id)
     if not contract_id:
-        print("Uploading ExtremeTest-Contract.pdf...")
-        try:
-            with open("ExtremeTest-Contract.pdf", "rb") as f:
-                res = requests.post("http://localhost:8000/upload", files={"files": f})
-                contract_id = res.json().get("contract_id")
-                if not contract_id and "uploads" in res.json():
-                    contract_id = res.json()["uploads"][0]["contract_id"]
-        except Exception as e:
-            print(f"Failed to upload: {e}")
-            contract_id = None
+        contract_id = upload_extreme_contract(session=session, chat_id=chat_id)
     
     print(f"Using contract_id: {contract_id}")
 
@@ -70,7 +103,11 @@ def main():
     for i, q in enumerate(QUESTIONS):
         print(f"[{i+1}/{len(QUESTIONS)}] Asking: {q}")
         try:
-            res = requests.post("http://localhost:8000/ask", json={"question": q, "contract_id": contract_id})
+            res = session.post(
+                f"{API_BASE_URL}/ask",
+                json={"question": q, "contract_id": contract_id, "chat_id": chat_id},
+                timeout=180,
+            )
             res.raise_for_status()
             data = res.json()
             answer = data.get("answer", "No answer")

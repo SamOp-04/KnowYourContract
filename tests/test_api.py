@@ -172,17 +172,37 @@ class _FakePipeline:
         return list(self._uploaded_contracts) + static_contracts
 
 
+class _FailingAskPipeline(_FakePipeline):
+    def ask(
+        self,
+        question: str,
+        contract_id: str | None = None,
+        ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
+    ):
+        raise RuntimeError("sensitive backend detail")
+
+
+class _FailingIngestPipeline(_FakePipeline):
+    def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None):
+        raise RuntimeError("internal parse failure detail")
+
+
+def _override_app_state(app, tmp_path, pipeline) -> None:
+    db_path = tmp_path / "test_metrics.db"
+    store = MetricsStore(database_url=f"sqlite:///{db_path}")
+    store.init_db()
+    app.state.metrics_store = store
+    app.state.evaluator = _FakeEvaluator()
+    app.state.pipeline = pipeline
+    app.state.chat_scope_registry = ChatScopeRegistry(registry_path=tmp_path / "chat_scope_registry.json")
+
+
 @pytest.fixture
 def client(tmp_path):
-    db_path = tmp_path / "test_metrics.db"
     app = create_app()
     with TestClient(app) as test_client:
-        store = MetricsStore(database_url=f"sqlite:///{db_path}")
-        store.init_db()
-        app.state.metrics_store = store
-        app.state.evaluator = _FakeEvaluator()
-        app.state.pipeline = _FakePipeline()
-        app.state.chat_scope_registry = ChatScopeRegistry(registry_path=tmp_path / "chat_scope_registry.json")
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
         yield test_client
 
 
@@ -301,3 +321,78 @@ def test_chat_scoped_contract_visibility_and_access(client: TestClient) -> None:
         },
     )
     assert blocked_query.status_code == 403
+
+
+def test_query_rejects_contract_without_chat_scope(client: TestClient) -> None:
+    response = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "contract_id": "sample_contract_20260407010101",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "chat_id is required when contract_id is provided."
+
+
+def test_auth_middleware_requires_api_key(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("API_AUTH_TOKEN", "secret-token")
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
+
+        unauthorized = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+        )
+        assert unauthorized.status_code == 401
+
+        authorized = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+            headers={"x-api-key": "secret-token"},
+        )
+        assert authorized.status_code == 200
+
+
+def test_strict_scope_policy_requires_chat_id(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("REQUIRE_CHAT_SCOPE", "1")
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
+
+        query_response = client.post(
+            "/query",
+            json={"query": "What is termination for convenience?"},
+        )
+        assert query_response.status_code == 400
+        assert query_response.json()["detail"] == "chat_id is required by server policy."
+
+        contracts_response = client.get("/contracts")
+        assert contracts_response.status_code == 400
+        assert contracts_response.json()["detail"] == "chat_id is required by server policy."
+
+
+def test_query_error_message_is_sanitized(tmp_path) -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FailingAskPipeline())
+        response = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+        )
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Pipeline query failed."
+
+
+def test_upload_error_message_is_sanitized(tmp_path) -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FailingIngestPipeline())
+        response = client.post(
+            "/upload",
+            data={"chat_id": "chat_a"},
+            files={"file": ("sample.txt", b"content", "text/plain")},
+        )
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Pipeline ingestion failed for sample.txt."

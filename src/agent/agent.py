@@ -48,7 +48,6 @@ class RuleBasedLocalLLM:
         "market",
         "benchmark",
         "industry",
-        "india",
         "statute",
         "regulation",
         "standard",

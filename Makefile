@@ -1,4 +1,4 @@
-.PHONY: install ingest api frontend dashboard run test eval deploy
+.PHONY: install ingest api frontend dashboard run test eval deploy migrate migration-revision
 
 install:
 	pip install -r requirements.txt
@@ -28,3 +28,9 @@ eval:
 
 deploy:
 	cd infra/terraform && terraform init && terraform apply
+
+migrate:
+	alembic upgrade head
+
+migration-revision:
+	alembic revision -m "$(msg)"

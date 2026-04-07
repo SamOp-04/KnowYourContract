@@ -217,6 +217,10 @@ data/processed/faiss_index/
 data/processed/bm25_index.pkl
 data/processed/chunk_metadata.json
 data/processed/metrics.db
+data/processed/*.db
+data/processed/*.db-*
+data/processed/*.sqlite3
+data/processed/*.sqlite3-*
 data/eval_samples/*.jsonl
 !data/eval_samples/.gitkeep
 

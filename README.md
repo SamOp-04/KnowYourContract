@@ -2,16 +2,16 @@
 
 Agentic RAG system for contract intelligence with hybrid retrieval, tool-routing, evaluation, monitoring, and production deployment.
 
-Tech stack: Python 3.11, LangChain, FAISS + BM25 (RRF), FastAPI, Streamlit, RAGAs, PostgreSQL, Docker, AWS ECS Fargate, Terraform, GitHub Actions.
+Tech stack: Python 3.11, LangChain, Chroma + optional BM25 rerank, FastAPI, Streamlit, RAGAs-style evaluation, SQLite/PostgreSQL, Docker, AWS ECS Fargate, Terraform, GitHub Actions.
 
 ## Live Demo
 
-- App URL: add deployed ALB URL after first ECS deploy
-- Monitoring URL: add `/dashboard/` route after deploy
+- App URL: set your ALB DNS name after first ECS deploy
+- Monitoring URL: `${ALB_DNS}/dashboard/`
 
 ## Resume Bullet
 
-Built a Legal Contract Analyzer using Agentic RAG (LangChain, FAISS + BM25, HuggingFace Qwen/Mistral) on CUAD (510 contracts); implemented hybrid retrieval, evaluated with RAGAs (faithfulness, answer relevance, context precision/recall), and deployed on AWS ECS Fargate with real-time monitoring.
+Built a Legal Contract Analyzer using Agentic RAG (LangChain, Chroma + BM25 rerank, HuggingFace/Ollama) on CUAD (510 contracts); implemented scoped multi-contract retrieval, evaluated with faithfulness/relevance/precision/recall signals, and deployed on AWS ECS Fargate with real-time monitoring.
 
 ## Problem Statement
 
@@ -46,20 +46,16 @@ Note: this dataset variant exposes a PDF feature column in some environments. Th
 
 ```mermaid
 flowchart TD
-		A[Streamlit Frontend] --> B[FastAPI /query]
-		B --> C[Agent Router]
-		C -->|contract_search| D[Hybrid Retriever]
-		C -->|web_search fallback| E[Tavily Search]
-		D --> D1[Dense Retriever FAISS]
-		D --> D2[Sparse Retriever BM25]
-		D1 --> D3[RRF Fusion]
-		D2 --> D3
-		D3 --> F[LLM Answer Generation]
-		E --> F
-		F --> B
-		B --> G[RAGAs Evaluator]
-		G --> H[(PostgreSQL)]
-		H --> I[Streamlit Monitoring Dashboard]
+		A[Streamlit Frontend] --> B[FastAPI /ask]
+		B --> C[ContractQAPipeline]
+		C --> D[Clause-Aware Retriever]
+		D --> D1[Chroma Dense Search]
+		D --> D2[Optional BM25 Rerank]
+		D2 --> E[Answer Generator]
+		E --> B
+		B --> F[Evaluator]
+		F --> G[(SQLite or PostgreSQL)]
+		G --> H[Streamlit Monitoring Dashboard]
 ```
 
 ## Why Hybrid Retrieval
@@ -93,11 +89,16 @@ legal-contract-analyzer/
 │   │   ├── loader.py
 │   │   ├── chunker.py
 │   │   └── embedder.py
-│   ├── retrieval/
+│   ├── pipeline/
 │   │   ├── __init__.py
-│   │   ├── dense_retriever.py
-│   │   ├── sparse_retriever.py
-│   │   └── hybrid_retriever.py
+│   │   ├── artifact_store.py
+│   │   ├── parser.py
+│   │   ├── chunker.py
+│   │   ├── embedder.py
+│   │   ├── retriever.py
+│   │   ├── answerer.py
+│   │   ├── contracts_registry.py
+│   │   └── chat_scope_registry.py
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── tools.py
@@ -113,7 +114,9 @@ legal-contract-analyzer/
 │   │   ├── main.py
 │   │   ├── routes/
 │   │   │   ├── __init__.py
+│   │   │   ├── ask.py
 │   │   │   ├── query.py
+│   │   │   ├── contracts.py
 │   │   │   ├── upload.py
 │   │   │   └── metrics.py
 │   │   └── schemas.py
@@ -125,7 +128,9 @@ legal-contract-analyzer/
 ├── tests/
 │   ├── test_retrieval.py
 │   ├── test_agent.py
-│   └── test_api.py
+│   ├── test_api.py
+│   ├── test_chunker.py
+│   └── test_ingestion_embedder.py
 ├── infra/
 │   ├── Dockerfile
 │   └── terraform/
@@ -173,13 +178,19 @@ make run
 
 ## API Endpoints
 
+- `POST /ask`
+	- Input: `{ "query": "...", "chat_id": "...", "contract_id": "optional" }`
+	- Output: answer, source chunks, citations, sources, tool used, routing reason, evaluation
 - `POST /query`
-	- Input: `{ "query": "...", "contract_id": "optional" }`
-	- Output: answer, source chunks, citations, tool used, routing reason
+	- Legacy-compatible query endpoint for answer + citations payload
 - `POST /upload`
-	- Upload custom `.txt` or `.pdf`, auto-indexes and refreshes retrievers
+	- Upload `.txt` or `.pdf`; returns `chat_id` and indexed contract ids
+- `GET /contracts`
+	- Lists contracts (filter by `chat_id` for scoped visibility)
 - `GET /metrics`
 	- Returns recent metric rows, trends, and routing analytics
+- Optional auth:
+	- Set `API_AUTH_TOKEN` and provide `x-api-key` header from clients
 
 ## Evaluation (RAGAs)
 
@@ -223,20 +234,30 @@ Dashboard features:
 	- Streamlit monitoring app
 	- PostgreSQL
 
+By default, metrics use SQLite unless `DATABASE_URL` points to PostgreSQL.
+
 ## AWS Deployment (ECS Fargate)
 
 Provisioned by Terraform:
 
 - ECR repos for API/dashboard images
 - ECS cluster and Fargate services
-- ALB path routing (`/api/*`, `/dashboard/*` patterns can be added in listener rules)
+- ALB path routing (dashboard available on `/dashboard/*`)
+- Optional HTTPS listener when `acm_certificate_arn` is configured
 - RDS PostgreSQL for metric logs
-- S3 bucket for FAISS artifact persistence
-- Secrets Manager for API keys
+- S3 bucket for artifact storage
+- Secrets Manager for API auth token, Tavily, and Hugging Face token
 
 Important production decision:
 
-- FAISS index is built once and persisted to S3, then loaded at startup to avoid repeated embedding cost and long cold starts.
+- Runtime retrieval uses persisted Chroma collections; ingestion refreshes per-contract chunks and metadata.
+- Optional strict tenant-style scoping can be enabled with `REQUIRE_CHAT_SCOPE=1`.
+- Contract and chat-scope registries support DB-backed persistence via `REGISTRY_BACKEND=auto|db|file` (use `db` with shared PostgreSQL in multi-instance deployments).
+- Uploaded raw contract text and retrieval chunk metadata support DB-backed persistence via `ARTIFACT_STORE_BACKEND=auto|db|file`.
+- When shared artifact storage is enabled, new instances can bootstrap local vector state from DB-backed chunks, keeping query behavior instance-independent.
+- Existing warm instances can periodically refresh local vector state from shared artifacts using `VECTOR_ARTIFACT_SYNC_INTERVAL_SECONDS`.
+- Run schema migrations with `alembic upgrade head` before starting API services in production.
+- Set `DB_AUTO_CREATE_TABLES=0` in production after migrations are managed through Alembic.
 
 ## CI/CD
 
@@ -290,4 +311,11 @@ make frontend
 make dashboard
 make eval
 make test
+make migrate
 ```
+
+Migration notes:
+
+- `make migrate` applies Alembic migrations to the database from `DATABASE_URL`.
+- Keep `DB_AUTO_CREATE_TABLES=1` for local SQLite convenience.
+- Set `DB_AUTO_CREATE_TABLES=0` in shared environments so schema lifecycle is migration-driven.

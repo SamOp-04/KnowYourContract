@@ -4,14 +4,14 @@ import argparse
 import json
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 try:
-    from datasets import Dataset, __version__ as DATASETS_VERSION, load_dataset
+    from datasets import Dataset as DatasetType, __version__ as DATASETS_VERSION, load_dataset
 
     DATASETS_SUPPORTS_TRUST_REMOTE_CODE = int(DATASETS_VERSION.split(".")[0]) < 4
 except Exception:
-    Dataset = Any  # type: ignore[assignment]
+    DatasetType: TypeAlias = Any
     DATASETS_SUPPORTS_TRUST_REMOTE_CODE = False
 
     def load_dataset(*args, **kwargs):  # type: ignore[no-redef]
@@ -46,7 +46,7 @@ ANSWER_FIELD_CANDIDATES = ("answers", "answer", "ground_truth")
 MAX_PDF_PAGES = 80
 
 
-def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "no_checks") -> Dataset:
+def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "no_checks") -> DatasetType:
     """Load datasets with compatibility across datasets library versions."""
     try:
         return load_dataset(dataset_id, split=split, verification_mode=verification_mode)
@@ -68,7 +68,7 @@ def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "
             raise load_error
 
 
-def load_cuad_dataset(dataset_id: str = PRIMARY_DATASET_ID, split: str = DEFAULT_SPLIT) -> Dataset:
+def load_cuad_dataset(dataset_id: str = PRIMARY_DATASET_ID, split: str = DEFAULT_SPLIT) -> DatasetType:
     """Load CUAD from HuggingFace with a fallback dataset id."""
     try:
         if dataset_id == PRIMARY_DATASET_ID:
@@ -233,7 +233,7 @@ def normalize_row(row: dict[str, Any], row_index: int) -> dict[str, Any]:
     }
 
 
-def save_raw_rows(dataset: Dataset, output_path: Path = RAW_OUTPUT_PATH) -> Path:
+def save_raw_rows(dataset: DatasetType, output_path: Path = RAW_OUTPUT_PATH) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         for row_index, row in enumerate(dataset):
@@ -242,7 +242,7 @@ def save_raw_rows(dataset: Dataset, output_path: Path = RAW_OUTPUT_PATH) -> Path
     return output_path
 
 
-def build_contract_records(dataset: Dataset) -> list[dict[str, Any]]:
+def build_contract_records(dataset: DatasetType) -> list[dict[str, Any]]:
     """Group question-centric CUAD rows into unique contract documents."""
     grouped: dict[str, dict[str, Any]] = {}
 

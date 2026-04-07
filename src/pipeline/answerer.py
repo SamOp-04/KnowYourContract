@@ -96,12 +96,13 @@ class MistralAnswerer:
         source_chunks: list[dict[str, Any]],
         question: str = "",
     ) -> tuple[str, list[dict[str, Any]]]:
-        _ = question
         sources = self.build_sources(source_chunks)
         if not sources:
             return answer.strip(), []
 
         cleaned = normalize_answer(answer)
+        if not cleaned and question.strip():
+            cleaned = f"Unable to produce a grounded answer for: {question.strip()}"
         if not re.search(r"\[\d+\]", cleaned):
             cleaned = f"{cleaned} [{sources[0]['index']}]"
 

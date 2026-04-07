@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
-from typing import Any
 
 try:
     from langchain.tools import StructuredTool
@@ -83,12 +82,14 @@ def build_contract_search_tool(retriever: Any) -> StructuredTool:
         )
 
         if contract_id:
+            normalized_contract_id = str(contract_id).strip().lower()
             filtered = []
             for item in results:
                 metadata = item.get("metadata", {})
-                contract_name = str(metadata.get("contract_name", "")).strip().lower()
                 metadata_contract_id = str(metadata.get("contract_id", "")).strip().lower()
-                if contract_name == contract_id.lower() or metadata_contract_id == contract_id.lower():
+                contract_name = str(metadata.get("contract_name", "")).strip().lower()
+                resolved_chunk_contract_id = metadata_contract_id or contract_name
+                if resolved_chunk_contract_id == normalized_contract_id:
                     filtered.append(item)
             results = filtered
 

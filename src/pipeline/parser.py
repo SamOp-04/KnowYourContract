@@ -70,21 +70,33 @@ class DocumentParser:
 
     @staticmethod
     def _extract_pdf_text(file_bytes: bytes) -> str:
+        errors: list[str] = []
+
         if fitz is not None:
             try:
                 document = fitz.open(stream=file_bytes, filetype="pdf")
                 pages = [page.get_text("text") for page in document]
                 document.close()
-                return "\n".join(pages)
-            except Exception:
-                pass
+                text = "\n".join(pages).strip()
+                if text:
+                    return text
+                errors.append("pymupdf extracted empty text")
+            except Exception as error:
+                errors.append(f"pymupdf: {error}")
 
         if PdfReader is not None:
             try:
                 reader = PdfReader(BytesIO(file_bytes))
                 pages = [page.extract_text() or "" for page in reader.pages]
-                return "\n".join(pages)
-            except Exception:
-                pass
+                text = "\n".join(pages).strip()
+                if text:
+                    return text
+                errors.append("pypdf extracted empty text")
+            except Exception as error:
+                errors.append(f"pypdf: {error}")
 
-        raise ValueError("PDF parsing failed. Install pymupdf (preferred) or ensure pypdf is available.")
+        details = "; ".join(errors) if errors else "no parser backend succeeded"
+        raise ValueError(
+            "PDF parsing failed. Install pymupdf (preferred) or ensure pypdf is available. "
+            f"Details: {details}"
+        )

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from src.api.schemas import ContractsResponse
 
 router = APIRouter(tags=["contracts"])
+
+
+def _strict_scope_enabled() -> bool:
+    return os.getenv("REQUIRE_CHAT_SCOPE", "").strip().lower() in {"1", "true", "yes"}
 
 
 @router.get("/contracts", response_model=ContractsResponse)
@@ -18,6 +24,9 @@ async def list_contracts(
             status_code=503,
             detail="Pipeline is not initialized. Check startup logs and dependencies.",
         )
+
+    if _strict_scope_enabled() and not str(chat_id or "").strip():
+        raise HTTPException(status_code=400, detail="chat_id is required by server policy.")
 
     contracts = list(pipeline.list_contracts())
 

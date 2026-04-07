@@ -1,10 +1,12 @@
+# pyright: reportInvalidTypeForm=false
+from __future__ import annotations
+
 
 
 ################################################################################
 # FILE: frontend/app.py
 ################################################################################
 
-from __future__ import annotations
 
 import os
 import uuid
@@ -14,6 +16,7 @@ import requests
 import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
 
 QUICK_QUESTIONS = [
     "What are the termination conditions?",
@@ -26,65 +29,43 @@ QUICK_QUESTIONS = [
 
 st.set_page_config(page_title="Legal Contract Analyzer", layout="wide")
 
-# Custom CSS for chat bubbles
-st.markdown(
-    '''
-    <style>
-    .chat-bubble-user {
-        background-color: #2b313e;
-        color: white;
-        padding: 10px 15px;
-        border-radius: 15px;
-        margin-bottom: 15px;
-        max-width: 80%;
-        float: right;
-        clear: both;
-    }
-    .chat-bubble-assistant {
-        background-color: #f0f2f6;
-        color: black;
-        padding: 10px 15px;
-        border-radius: 15px;
-        margin-bottom: 15px;
-        max-width: 80%;
-        float: left;
-        clear: both;
-    }
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        width: 100%;
-    }
-    .clearfix::after {
-        content: "";
-        clear: both;
-        display: table;
-    }
-    </style>
-    ''',
-    unsafe_allow_html=True
-)
+
+def _request_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if API_AUTH_TOKEN:
+        headers["x-api-key"] = API_AUTH_TOKEN
+    return headers
 
 if "sessions" not in st.session_state:
     st.session_state.sessions = {}
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
-if "contract_id" not in st.session_state:
-    st.session_state.contract_id = None
-if "contracts" not in st.session_state:
-    st.session_state.contracts = []
+if "chat_contracts" not in st.session_state:
+    st.session_state.chat_contracts = {}
+if "chat_active_contract" not in st.session_state:
+    st.session_state.chat_active_contract = {}
 
 def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=120)
+    response = requests.post(
+        f"{API_BASE_URL}{path}",
+        json=payload,
+        headers=_request_headers(),
+        timeout=120,
+    )
     response.raise_for_status()
     return response.json()
 
-def _get_json(path: str) -> dict[str, Any]:
-    response = requests.get(f"{API_BASE_URL}{path}", timeout=60)
+def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = requests.get(
+        f"{API_BASE_URL}{path}",
+        params=params or {},
+        headers=_request_headers(),
+        timeout=60,
+    )
     response.raise_for_status()
     return response.json()
 
-def _post_files(path: str, uploads: list[Any]) -> dict[str, Any]:
+def _post_files(path: str, uploads: list[Any], chat_id: str) -> dict[str, Any]:
     multipart_files = []
     for uploaded_file in uploads:
         multipart_files.append(
@@ -97,26 +78,52 @@ def _post_files(path: str, uploads: list[Any]) -> dict[str, Any]:
                 ),
             )
         )
-    response = requests.post(f"{API_BASE_URL}{path}", files=multipart_files, timeout=600)
+    response = requests.post(
+        f"{API_BASE_URL}{path}",
+        files=multipart_files,
+        data={"chat_id": chat_id},
+        headers=_request_headers(),
+        timeout=600,
+    )
     response.raise_for_status()
     return response.json()
 
-def _refresh_contracts() -> None:
+def _ensure_chat_state(chat_id: str) -> None:
+    if chat_id not in st.session_state.sessions:
+        st.session_state.sessions[chat_id] = []
+    if chat_id not in st.session_state.chat_contracts:
+        st.session_state.chat_contracts[chat_id] = []
+    if chat_id not in st.session_state.chat_active_contract:
+        st.session_state.chat_active_contract[chat_id] = None
+
+
+def _refresh_contracts(chat_id: str) -> None:
+    _ensure_chat_state(chat_id)
     try:
-        payload = _get_json("/contracts")
-        st.session_state.contracts = list(payload.get("contracts", []))
+        payload = _get_json("/contracts", params={"chat_id": chat_id})
+        contracts = list(payload.get("contracts", []))
+        st.session_state.chat_contracts[chat_id] = contracts
+
+        active_contract = st.session_state.chat_active_contract.get(chat_id)
+        available_contract_ids = {
+            str(item.get("contract_id"))
+            for item in contracts
+            if item.get("contract_id")
+        }
+        if active_contract and active_contract not in available_contract_ids:
+            st.session_state.chat_active_contract[chat_id] = None
     except Exception:
-        st.session_state.contracts = []
+        st.session_state.chat_contracts[chat_id] = []
 
 def start_new_session():
     new_id = str(uuid.uuid4())
-    st.session_state.sessions[new_id] = []
+    _ensure_chat_state(new_id)
     st.session_state.current_session_id = new_id
 
 if not st.session_state.current_session_id:
     start_new_session()
 
-_refresh_contracts()
+_refresh_contracts(st.session_state.current_session_id)
 
 with st.sidebar:
     st.title("Chats")
@@ -134,60 +141,64 @@ with st.sidebar:
         button_type = "primary" if session_id == st.session_state.current_session_id else "secondary"
         if st.button(label, key=f"btn_{session_id}", use_container_width=True, type=button_type):
             st.session_state.current_session_id = session_id
+            _refresh_contracts(session_id)
             
     st.markdown("---")
     st.header("Contract Context")
     
     with st.expander("Upload & Select Contract"):
+        current_chat_id = st.session_state.current_session_id
         uploaded_files = st.file_uploader(
             "Upload contract(s) (.txt or .pdf)",
             type=["txt", "pdf"],
             accept_multiple_files=True,
+            key=f"uploader_{current_chat_id}",
         )
-        if uploaded_files and st.button("Index", type="primary"):
+        if uploaded_files and st.button("Index", type="primary", key=f"index_{current_chat_id}"):
             try:
-                payload = _post_files("/upload", uploads=list(uploaded_files))
+                payload = _post_files("/upload", uploads=list(uploaded_files), chat_id=current_chat_id)
                 uploaded_items = list(payload.get("uploads", []))
                 if uploaded_items:
-                    st.session_state.contract_id = uploaded_items[-1].get("contract_id")
+                    st.session_state.chat_active_contract[current_chat_id] = uploaded_items[-1].get("contract_id")
                 else:
-                    st.session_state.contract_id = payload.get("contract_id")
-                _refresh_contracts()
+                    st.session_state.chat_active_contract[current_chat_id] = payload.get("contract_id")
+                _refresh_contracts(current_chat_id)
                 st.success("Indexing complete!")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
 
-        contracts = st.session_state.contracts
+        contracts = st.session_state.chat_contracts.get(current_chat_id, [])
         if contracts:
             contracts_by_id = {str(item.get("contract_id")): item for item in contracts if item.get("contract_id")}
             scope_options = ["__all_contracts__"] + list(contracts_by_id.keys())
+            current_scope = st.session_state.chat_active_contract.get(current_chat_id) or "__all_contracts__"
+            if current_scope not in scope_options:
+                current_scope = "__all_contracts__"
             
             selected_scope = st.selectbox(
                 "Active Contract:",
                 options=scope_options,
-                format_func=lambda item: "All contracts" if item == "__all_contracts__" else f"{contracts_by_id.get(item, {}).get('display_name', item)}"
+                index=scope_options.index(current_scope),
+                key=f"scope_{current_chat_id}",
+                format_func=lambda item: "All contracts in this chat" if item == "__all_contracts__" else f"{contracts_by_id.get(item, {}).get('display_name', item)}"
             )
-            st.session_state.contract_id = None if selected_scope == "__all_contracts__" else selected_scope
+            st.session_state.chat_active_contract[current_chat_id] = None if selected_scope == "__all_contracts__" else selected_scope
 
 st.title("Contract Analyzer")
 
 current_messages = st.session_state.sessions[st.session_state.current_session_id]
 
 # Display history
-st.markdown('<div class="chat-container">', unsafe_allow_html=True)
 for msg in current_messages:
-    if msg["role"] == "user":
-        st.markdown(f'<div class="chat-bubble-user">{msg["content"]}</div><div class="clearfix"></div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="chat-bubble-assistant">{msg["content"]}</div>', unsafe_allow_html=True)
+    role = "user" if msg["role"] == "user" else "assistant"
+    with st.chat_message(role):
+        st.write(msg["content"])
         if "citations" in msg and msg["citations"]:
             with st.expander("View Source Chunks"):
                 for cit in msg["citations"]:
-                    st.markdown(f"**From:** `{cit.get('source_document', 'Unknown')}`")
-                    st.write(cit.get('text', 'No text provided.'))
+                    st.markdown(f"**Contract:** {cit.get('contract_name', 'Unknown')}")
+                    st.markdown(f"**Chunk:** {cit.get('chunk_id', 'unknown_chunk')}")
                     st.divider()
-        st.markdown('<div class="clearfix"></div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
 # Quick questions handler
 if not current_messages:
@@ -208,28 +219,174 @@ if "quick_query" in st.session_state and st.session_state.quick_query:
 if query:
     # Append user message
     st.session_state.sessions[st.session_state.current_session_id].append({"role": "user", "content": query})
-    st.markdown(f'<div class="chat-bubble-user">{query}</div><div class="clearfix"></div>', unsafe_allow_html=True)
-    
     with st.spinner("Analyzing contract..."):
         try:
             payload = {
                 "question": query,
-                "contract_id": st.session_state.contract_id,
+                "contract_id": st.session_state.chat_active_contract.get(st.session_state.current_session_id),
+                "chat_id": st.session_state.current_session_id,
             }
             result = _post_json("/ask", payload)
             answer = result.get("answer", "No answer generated.")
             citations = result.get("citations", [])
-            
-            # Append assistant message
-            st.session_state.sessions[st.session_state.current_session_id].append({
-                "role": "assistant",
-                "content": answer,
-                "citations": citations
+
+            st.session_state.sessions[st.session_state.current_session_id].append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "citations": citations,
+                }
+            )
+        except Exception as error:
+            st.session_state.sessions[st.session_state.current_session_id].append(
+                {
+                    "role": "assistant",
+                    "content": f"Error querying backend: {error}",
+                    "citations": [],
+                }
+            )
+
+    st.rerun()
+
+
+################################################################################
+# FILE: run_batch_eval_extreme.py
+################################################################################
+
+import os
+import time
+import uuid
+
+import requests
+
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
+EVAL_CHAT_ID = os.getenv("EXTREME_EVAL_CHAT_ID", "extreme_eval_chat")
+
+QUESTIONS = [
+    "What are all the hourly rate tiers for Key Personnel and at what hour thresholds do they change?",
+    "What are the different hotel rate limits and when does each apply?",
+    "What are all the monetary caps in this agreement? List every dollar figure mentioned.",
+    "What triggers each different type of termination, and what payment is owed in each case?",
+    "What are the different notice periods required for different actions in this contract?",
+    "The contract has both a liability cap and exceptions to that cap - what is the cap, and what are ALL the exceptions?",
+    "Consultant's IP indemnification is said to be unlimited in Section 7.D but a general cap exists in Section 8.B - which governs IP claims?",
+    "Can the monthly retainer be applied against hourly fees?",
+    "Does the non-compete apply if Company terminates for convenience?",
+    "What happens if a Force Majeure Event lasts more than 90 days AND there is an active unpaid invoice?",
+    "If Company suspends an SOW for 100 days, what rights does Consultant have?",
+    "What obligations survive termination of this agreement, and for how long does each survive?",
+    "Under what conditions can Company conduct more than one audit per year?",
+    "What is the penalty if Consultant misses the 5th business day invoice deadline?",
+    "Does this contract require Consultant to carry Directors & Officers (D&O) insurance?",
+    "What happens if both Key Personnel and a Force Majeure Event occur simultaneously?",
+    "Is there a minimum number of hours Consultant must bill per month?",
+    "How many days notice must Consultant give to terminate for convenience?",
+    "How long must records be retained after final payment?",
+    "What is the liquidated damages amount for a non-compete breach, and is it per breach or aggregate?",
+    "Within how many hours must a data breach be reported to Company?",
+    "How many depositions is each party entitled to in arbitration discovery?",
+    "Under what conditions is Consultant entitled to business class air travel?",
+    "When does the overbilling audit cost shift to Consultant?",
+    "What conditions must be met before Consultant can suspend services for non-payment?",
+    "What happens to open source components - when are they allowed and what must be delivered with them?",
+    "Who are the Key Personnel and what are their specific roles?",
+    "Who signed this agreement and on behalf of which entities?",
+    "Which companies are currently on the Restricted Competitors list?",
+    "Who must approve Change Orders exceeding $50,000?"
+]
+
+def get_latest_extreme_contract(session: "requests.Session", chat_id: str) -> str | None:
+    try:
+        res = session.get(f"{API_BASE_URL}/contracts", params={"chat_id": chat_id}, timeout=60)
+        res.raise_for_status()
+        contracts = res.json().get("contracts", [])
+        for c in reversed(contracts):
+            contract_id = str(c.get("contract_id", ""))
+            display_name = str(c.get("display_name", ""))
+            source_name = str(c.get("source_name", ""))
+            haystack = f"{contract_id} {display_name} {source_name}".lower()
+            if "extremetest" in haystack or "extreme-test" in haystack:
+                return c["contract_id"]
+    except Exception as e:
+        print(f"Error fetching contracts: {e}")
+    return None
+
+
+def upload_extreme_contract(session: "requests.Session", chat_id: str) -> str | None:
+    print("Uploading ExtremeTest-Contract.pdf...")
+    try:
+        with open("ExtremeTest-Contract.pdf", "rb") as file_handle:
+            response = session.post(
+                f"{API_BASE_URL}/upload",
+                data={"chat_id": chat_id},
+                files={"file": ("ExtremeTest-Contract.pdf", file_handle, "application/pdf")},
+                timeout=300,
+            )
+        response.raise_for_status()
+        payload = response.json()
+
+        contract_id = payload.get("contract_id")
+        if contract_id:
+            return str(contract_id)
+
+        uploads = payload.get("uploads", [])
+        if isinstance(uploads, list) and uploads:
+            return str(uploads[0].get("contract_id", "")) or None
+    except Exception as e:
+        print(f"Failed to upload: {e}")
+
+    return None
+
+def main():
+    chat_id = str(EVAL_CHAT_ID or "").strip() or f"extreme_eval_{uuid.uuid4().hex[:8]}"
+    session = requests.Session()
+    if API_AUTH_TOKEN:
+        session.headers.update({"x-api-key": API_AUTH_TOKEN})
+
+    contract_id = get_latest_extreme_contract(session=session, chat_id=chat_id)
+    if not contract_id:
+        contract_id = upload_extreme_contract(session=session, chat_id=chat_id)
+    
+    print(f"Using contract_id: {contract_id}")
+
+    results = []
+    
+    with open("extreme_eval_results.md", "w", encoding="utf-8") as f:
+        f.write("# ExtremeTest Contract Evaluation Results\n\n")
+
+    for i, q in enumerate(QUESTIONS):
+        print(f"[{i+1}/{len(QUESTIONS)}] Asking: {q}")
+        try:
+            res = session.post(
+                f"{API_BASE_URL}/ask",
+                json={"question": q, "contract_id": contract_id, "chat_id": chat_id},
+                timeout=180,
+            )
+            res.raise_for_status()
+            data = res.json()
+            answer = data.get("answer", "No answer")
+            results.append({
+                "question": q,
+                "answer": answer
             })
-            st.rerun()
-            
+            print(f"Answer: {answer[:100]}...\n")
         except Exception as e:
-            st.error(f"Error querying backend: {e}")
+            print(f"Error: {e}")
+            answer = f"ERROR: {e}"
+            results.append({
+                "question": q,
+                "answer": answer
+            })
+            time.sleep(2)
+            
+        with open("extreme_eval_results.md", "a", encoding="utf-8") as f:
+            f.write(f"### Q: {q}\n**A:** {answer}\n\n---\n")
+
+    print("Done! Results saved to extreme_eval_results.md")
+
+if __name__ == "__main__":
+    main()
 
 
 ################################################################################
@@ -254,7 +411,6 @@ __all__ = ["LegalContractAgent"]
 # FILE: src/agent/agent.py
 ################################################################################
 
-from __future__ import annotations
 
 import json
 import os
@@ -277,7 +433,6 @@ except Exception:
 
 from src.agent.prompts import ANSWER_SYSTEM_PROMPT, ROUTER_SYSTEM_PROMPT
 from src.agent.tools import build_tools
-from src.retrieval.hybrid_retriever import HybridRetriever
 
 try:
     from langchain_community.chat_models import ChatOllama
@@ -305,7 +460,6 @@ class RuleBasedLocalLLM:
         "market",
         "benchmark",
         "industry",
-        "india",
         "statute",
         "regulation",
         "standard",
@@ -451,14 +605,20 @@ class LegalContractAgent:
 
     def __init__(
         self,
-        hybrid_retriever: HybridRetriever,
+        retriever: Any | None = None,
+        clause_retriever: Any | None = None,
+        hybrid_retriever: Any | None = None,
         llm: Any | None = None,
         model_name: str | None = None,
         temperature: float = 0.0,
     ) -> None:
-        self.hybrid_retriever = hybrid_retriever
+        resolved_retriever = retriever or clause_retriever or hybrid_retriever
+        if resolved_retriever is None:
+            raise ValueError("A contract retriever is required.")
+
+        self.retriever = resolved_retriever
         self.llm = llm or self._build_default_llm(model_name=model_name, temperature=temperature)
-        self.tools = build_tools(hybrid_retriever=hybrid_retriever)
+        self.tools = build_tools(retriever=resolved_retriever)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
     def _build_default_llm(self, model_name: str | None, temperature: float) -> Any:
@@ -595,7 +755,6 @@ class LegalContractAgent:
 # FILE: src/agent/prompts.py
 ################################################################################
 
-from __future__ import annotations
 
 ROUTER_SYSTEM_PROMPT = """
 You are a legal question routing agent for a contract analysis system.
@@ -628,7 +787,6 @@ Rules:
 # FILE: src/agent/tools.py
 ################################################################################
 
-from __future__ import annotations
 
 import json
 import os
@@ -657,18 +815,69 @@ try:
 except Exception:
     TavilySearchResults = None
 
-from src.retrieval.hybrid_retriever import HybridRetriever
+def _coerce_results(raw_results: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_results, list):
+        return []
+
+    output: list[dict[str, Any]] = []
+    for item in raw_results:
+        if isinstance(item, dict):
+            output.append(item)
+            continue
+
+        metadata = dict(getattr(item, "metadata", {}) or {})
+        output.append(
+            {
+                "chunk_id": str(getattr(item, "chunk_id", metadata.get("chunk_id", ""))),
+                "text": str(getattr(item, "text", getattr(item, "page_content", ""))),
+                "metadata": metadata,
+            }
+        )
+
+    return output
 
 
-def build_contract_search_tool(hybrid_retriever: HybridRetriever) -> StructuredTool:
+def _retrieve_contract_chunks(
+    retriever: Any,
+    query: str,
+    contract_id: str | None,
+    k: int,
+) -> list[dict[str, Any]]:
+    attempts = [
+        {"query": query, "contract_id": contract_id, "k": k, "clause_hints": []},
+        {"query": query, "contract_id": contract_id, "k": k},
+        {"query": query, "k": k, "dense_k": max(12, k * 4), "sparse_k": max(12, k * 4)},
+        {"query": query, "k": k},
+    ]
+
+    for kwargs in attempts:
+        try:
+            raw_results = retriever.get_top_k(**kwargs)
+        except TypeError:
+            continue
+        return _coerce_results(raw_results)
+
+    raise RuntimeError("Retriever does not expose a compatible get_top_k signature.")
+
+
+def build_contract_search_tool(retriever: Any) -> StructuredTool:
     def contract_search(query: str, contract_id: str | None = None) -> str:
-        results = hybrid_retriever.get_top_k(query=query, k=5, dense_k=20, sparse_k=20)
+        results = _retrieve_contract_chunks(
+            retriever=retriever,
+            query=query,
+            contract_id=contract_id,
+            k=5,
+        )
 
         if contract_id:
+            normalized_contract_id = str(contract_id).strip().lower()
             filtered = []
             for item in results:
-                contract_name = str(item.get("metadata", {}).get("contract_name", "")).lower()
-                if contract_name == contract_id.lower():
+                metadata = item.get("metadata", {})
+                metadata_contract_id = str(metadata.get("contract_id", "")).strip().lower()
+                contract_name = str(metadata.get("contract_name", "")).strip().lower()
+                resolved_chunk_contract_id = metadata_contract_id or contract_name
+                if resolved_chunk_contract_id == normalized_contract_id:
                     filtered.append(item)
             results = filtered
 
@@ -682,7 +891,8 @@ def build_contract_search_tool(hybrid_retriever: HybridRetriever) -> StructuredT
     return StructuredTool.from_function(
         name="contract_search",
         description=(
-            "Search legal contract chunks with hybrid BM25 + dense retrieval and return top passages. "
+            "Search legal contract chunks with clause-aware Chroma retrieval and optional BM25 reranking, "
+            "and return top passages. "
             "Use this for questions about clause text, obligations, limits, termination terms, and definitions."
         ),
         func=contract_search,
@@ -724,9 +934,9 @@ def build_web_search_tool(max_results: int = 5) -> StructuredTool:
     )
 
 
-def build_tools(hybrid_retriever: HybridRetriever) -> list[StructuredTool]:
+def build_tools(retriever: Any) -> list[StructuredTool]:
     return [
-        build_contract_search_tool(hybrid_retriever=hybrid_retriever),
+        build_contract_search_tool(retriever=retriever),
         build_web_search_tool(),
     ]
 
@@ -742,13 +952,12 @@ def build_tools(hybrid_retriever: HybridRetriever) -> list[StructuredTool]:
 # FILE: src/api/main.py
 ################################################################################
 
-from __future__ import annotations
 
-import asyncio
+import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 try:
     from dotenv import load_dotenv
@@ -756,16 +965,15 @@ except Exception:
     def load_dotenv() -> bool:  # type: ignore[no-redef]
         return False
 
-from src.agent.agent import LegalContractAgent
 from src.api.routes.ask import router as ask_router
 from src.api.routes.contracts import router as contracts_router
 from src.api.routes.metrics import router as metrics_router
 from src.api.routes.query import router as query_router
 from src.api.routes.upload import router as upload_router
 from src.evaluation.metrics_store import MetricsStore
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
+from src.pipeline.chat_scope_registry import ChatScopeRegistry
 from src.pipeline.pipeline import ContractQAPipeline
-from src.retrieval.hybrid_retriever import HybridRetriever
 
 load_dotenv()
 
@@ -776,20 +984,9 @@ def create_app() -> FastAPI:
         metrics_store = MetricsStore()
         metrics_store.init_db()
         app.state.metrics_store = metrics_store
-        app.state.evaluator = RagasEvaluator(use_ragas=True)
+        app.state.evaluator = ContractQAEvaluator(use_llm_judge=True)
         app.state.pipeline = ContractQAPipeline(evaluator=app.state.evaluator)
-        app.state.agent_lock = asyncio.Lock()
-
-        chunks_path = Path("data/processed/chunks.jsonl")
-        faiss_dir = Path("data/processed/faiss_index")
-
-        if chunks_path.exists() and faiss_dir.exists():
-            hybrid_retriever = HybridRetriever.from_artifacts()
-            app.state.hybrid_retriever = hybrid_retriever
-            app.state.agent = LegalContractAgent(hybrid_retriever=hybrid_retriever)
-        else:
-            app.state.hybrid_retriever = None
-            app.state.agent = None
+        app.state.chat_scope_registry = ChatScopeRegistry()
             
         yield
 
@@ -799,6 +996,21 @@ def create_app() -> FastAPI:
         description="Agentic RAG backend for legal contract analysis using CUAD.",
         lifespan=lifespan,
     )
+
+    auth_token = os.getenv("API_AUTH_TOKEN", "").strip()
+    if auth_token:
+        exempt_paths = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+        @app.middleware("http")
+        async def _require_api_token(request, call_next):
+            if request.url.path in exempt_paths:
+                return await call_next(request)
+
+            provided = str(request.headers.get("x-api-key", "")).strip()
+            if not provided or provided != auth_token:
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+            return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -826,39 +1038,13 @@ app = create_app()
 # FILE: src/api/routes/ask.py
 ################################################################################
 
-from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, BackgroundTasks, Request
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
-
+from src.api.routes._pipeline_qa import run_pipeline_query, schedule_pipeline_metrics
 from src.api.schemas import AskRequest, AskResponse
 
 router = APIRouter(tags=["ask"])
-
-
-def _store_pipeline_metrics(
-    request: Request,
-    query: str,
-    answer: str,
-    tool_used: str,
-    used_web_fallback: bool,
-    evaluation: dict[str, Any],
-) -> None:
-    metrics_store = request.app.state.metrics_store
-    metrics_store.save_metric(
-        {
-            "query": query,
-            "answer": answer,
-            "tool_used": tool_used,
-            "used_web_fallback": used_web_fallback,
-            "faithfulness": float(evaluation.get("faithfulness", 0.0)),
-            "answer_relevance": float(evaluation.get("answer_relevance", 0.0)),
-            "context_precision": float(evaluation.get("context_precision", 0.0)),
-            "context_recall": float(evaluation.get("context_recall", 0.0)),
-        }
-    )
 
 
 @router.post("/ask", response_model=AskResponse)
@@ -867,32 +1053,18 @@ async def ask_contract(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> AskResponse:
-    pipeline = getattr(request.app.state, "pipeline", None)
-    if pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Pipeline is not initialized. Check startup logs and dependencies.",
-        )
-
-    try:
-        result = await run_in_threadpool(
-            pipeline.ask,
-            payload.query,
-            payload.contract_id,
-            payload.ground_truth or "",
-        )
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Ask failed: {error}") from error
-
-    evaluation = dict(result.get("evaluation", {}))
-    background_tasks.add_task(
-        _store_pipeline_metrics,
-        request,
-        payload.query,
-        str(result.get("answer", "")),
-        str(result.get("tool_used", "pipeline_contract_search")),
-        bool(result.get("used_web_fallback", False)),
-        evaluation,
+    result = await run_pipeline_query(
+        request=request,
+        query=payload.query,
+        contract_id=payload.contract_id,
+        ground_truth=payload.ground_truth or "",
+        chat_id=payload.chat_id,
+    )
+    evaluation = schedule_pipeline_metrics(
+        background_tasks=background_tasks,
+        request=request,
+        query=payload.query,
+        result=result,
     )
 
     return AskResponse(
@@ -912,17 +1084,25 @@ async def ask_contract(
 # FILE: src/api/routes/contracts.py
 ################################################################################
 
-from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+import os
+
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from src.api.schemas import ContractsResponse
 
 router = APIRouter(tags=["contracts"])
 
 
+def _strict_scope_enabled() -> bool:
+    return os.getenv("REQUIRE_CHAT_SCOPE", "").strip().lower() in {"1", "true", "yes"}
+
+
 @router.get("/contracts", response_model=ContractsResponse)
-async def list_contracts(request: Request) -> ContractsResponse:
+async def list_contracts(
+    request: Request,
+    chat_id: str | None = Query(default=None),
+) -> ContractsResponse:
     pipeline = getattr(request.app.state, "pipeline", None)
     if pipeline is None:
         raise HTTPException(
@@ -930,7 +1110,23 @@ async def list_contracts(request: Request) -> ContractsResponse:
             detail="Pipeline is not initialized. Check startup logs and dependencies.",
         )
 
+    if _strict_scope_enabled() and not str(chat_id or "").strip():
+        raise HTTPException(status_code=400, detail="chat_id is required by server policy.")
+
     contracts = list(pipeline.list_contracts())
+
+    if chat_id:
+        chat_scope_registry = getattr(request.app.state, "chat_scope_registry", None)
+        if chat_scope_registry is None:
+            raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
+
+        allowed_contract_ids = set(chat_scope_registry.list_contract_ids(chat_id))
+        contracts = [
+            item
+            for item in contracts
+            if str(item.get("contract_id", "")).strip() in allowed_contract_ids
+        ]
+
     return ContractsResponse(contracts=contracts, total=len(contracts))
 
 
@@ -938,7 +1134,6 @@ async def list_contracts(request: Request) -> ContractsResponse:
 # FILE: src/api/routes/metrics.py
 ################################################################################
 
-from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 
@@ -965,55 +1160,13 @@ async def get_metrics(
 # FILE: src/api/routes/query.py
 ################################################################################
 
-from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, BackgroundTasks, Request
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
-
+from src.api.routes._pipeline_qa import run_pipeline_query, schedule_pipeline_metrics
 from src.api.schemas import QueryRequest, QueryResponse
 
 router = APIRouter(tags=["query"])
-
-
-def _extract_contexts(source_chunks: list[dict[str, Any]]) -> list[str]:
-    contexts = []
-    for chunk in source_chunks:
-        if not isinstance(chunk, dict):
-            continue
-        text = chunk.get("text") or chunk.get("content") or ""
-        if text:
-            contexts.append(str(text))
-    return contexts
-
-
-def _evaluate_and_store(
-    request: Request,
-    query: str,
-    answer: str,
-    contexts: list[str],
-    tool_used: str,
-    used_web_fallback: bool,
-) -> None:
-    evaluator = request.app.state.evaluator
-    store = request.app.state.metrics_store
-
-    metrics = evaluator.evaluate_single(
-        question=query,
-        answer=answer,
-        contexts=contexts,
-        ground_truth="",
-    )
-
-    payload = {
-        "query": query,
-        "answer": answer,
-        "tool_used": tool_used,
-        "used_web_fallback": used_web_fallback,
-        **metrics,
-    }
-    store.save_metric(payload)
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -1022,37 +1175,27 @@ async def query_contract(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> QueryResponse:
-    agent = getattr(request.app.state, "agent", None)
-    if agent is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Agent is not initialized. Run ingestion and embedding pipeline first.",
-        )
-
-    try:
-        result = await run_in_threadpool(agent.run, payload.query, payload.contract_id)
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Query failed: {error}") from error
-
-    source_chunks = result.get("source_chunks", [])
-    contexts = _extract_contexts(source_chunks)
-    background_tasks.add_task(
-        _evaluate_and_store,
-        request,
-        payload.query,
-        result.get("answer", ""),
-        contexts,
-        result.get("tool_used", "contract_search"),
-        bool(result.get("used_web_fallback", False)),
+    result = await run_pipeline_query(
+        request=request,
+        query=payload.query,
+        contract_id=payload.contract_id,
+        ground_truth="",
+        chat_id=payload.chat_id,
+    )
+    schedule_pipeline_metrics(
+        background_tasks=background_tasks,
+        request=request,
+        query=payload.query,
+        result=result,
     )
 
     return QueryResponse(
-        answer=result.get("answer", ""),
-        citations=result.get("citations", []),
-        sources=result.get("sources", []),
-        source_chunks=source_chunks,
-        tool_used=result.get("tool_used", "contract_search"),
-        route_reason=result.get("route_reason", ""),
+        answer=str(result.get("answer", "")),
+        citations=list(result.get("citations", [])),
+        sources=list(result.get("sources", [])),
+        source_chunks=list(result.get("source_chunks", [])),
+        tool_used=str(result.get("tool_used", "pipeline_contract_search")),
+        route_reason=str(result.get("route_reason", "")),
         used_web_fallback=bool(result.get("used_web_fallback", False)),
     )
 
@@ -1061,78 +1204,38 @@ async def query_contract(
 # FILE: src/api/routes/upload.py
 ################################################################################
 
-from __future__ import annotations
 
-import asyncio
-import json
+import logging
+import os
+import re
+import uuid
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
-from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
-
-from src.agent.agent import LegalContractAgent
 from src.api.schemas import UploadBatchResponse, UploadItemResponse, UploadResponse
-from src.ingestion.chunker import build_splitter, chunk_contract
-from src.ingestion.embedder import build_faiss_index, build_sparse_index, save_metadata
-from src.retrieval.hybrid_retriever import HybridRetriever
 
 router = APIRouter(tags=["upload"])
-
-RAW_UPLOAD_DIR = Path("data/raw/uploads")
-CHUNKS_PATH = Path("data/processed/chunks.jsonl")
-FAISS_DIR = Path("data/processed/faiss_index")
-METADATA_PATH = Path("data/processed/chunk_metadata.json")
+logger = logging.getLogger(__name__)
 
 
-def _extract_text(filename: str, file_bytes: bytes) -> str:
-    suffix = Path(filename).suffix.lower()
-    if suffix == ".pdf":
-        if PdfReader is None:
-            raise ValueError("PDF parsing requires pypdf to be installed.")
-        reader = PdfReader(BytesIO(file_bytes))
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n".join(pages)
-
-    return file_bytes.decode("utf-8", errors="ignore")
+def _strict_scope_enabled() -> bool:
+    return os.getenv("REQUIRE_CHAT_SCOPE", "").strip().lower() in {"1", "true", "yes"}
 
 
-def _append_chunks(chunks: list[dict[str, Any]]) -> None:
-    CHUNKS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with CHUNKS_PATH.open("a", encoding="utf-8") as file:
-        for chunk in chunks:
-            file.write(json.dumps(chunk) + "\n")
-
-
-def _rebuild_indexes() -> HybridRetriever:
-    if not CHUNKS_PATH.exists():
-        raise FileNotFoundError(f"Missing chunks file at {CHUNKS_PATH}")
-
-    chunks = []
-    with CHUNKS_PATH.open("r", encoding="utf-8") as file:
-        for line in file:
-            if line.strip():
-                chunks.append(json.loads(line))
-
-    build_faiss_index(chunks=chunks, output_dir=FAISS_DIR)
-    save_metadata(chunks=chunks, output_path=METADATA_PATH)
-    build_sparse_index(chunks=chunks)
-
-    return HybridRetriever.from_artifacts()
-
+def _safe_contract_stem(filename: str | None, fallback: str) -> str:
+    stem = Path(filename or fallback).stem
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    return cleaned or fallback
 
 @router.post("/upload", response_model=UploadResponse | UploadBatchResponse)
 async def upload_contract(
     request: Request,
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] | None = File(default=None),
+    chat_id: str | None = Form(default=None),
 ) -> UploadResponse | UploadBatchResponse:
 
     upload_items: list[UploadFile] = []
@@ -1148,19 +1251,28 @@ async def upload_contract(
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline is not initialized.")
 
+    chat_scope_registry = getattr(request.app.state, "chat_scope_registry", None)
+    if chat_scope_registry is None:
+        raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
+
+    strict_scope = _strict_scope_enabled()
+    if strict_scope and not str(chat_id or "").strip():
+        raise HTTPException(status_code=400, detail="chat_id is required by server policy.")
+
+    resolved_chat_id = str(chat_id or "").strip() or str(uuid.uuid4())
+
     upload_results: list[UploadItemResponse] = []
-    legacy_chunks_to_append: list[dict[str, Any]] = []
 
     for index, upload in enumerate(upload_items, start=1):
         file_bytes = bytearray()
         CHUNK_SIZE = 1024 * 1024
         MAX_SIZE = 10 * 1024 * 1024
-        
+
         while chunk := await upload.read(CHUNK_SIZE):
             file_bytes.extend(chunk)
             if len(file_bytes) > MAX_SIZE:
                 raise HTTPException(status_code=413, detail=f"File too large: {upload.filename}")
-                
+
         file_bytes = bytes(file_bytes)
         if not file_bytes:
             raise HTTPException(
@@ -1169,7 +1281,7 @@ async def upload_contract(
             )
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-        base_name = Path(upload.filename or f"contract_{index}").stem
+        base_name = _safe_contract_stem(upload.filename, f"contract_{index}")
         contract_id = f"{base_name}_{timestamp}"
 
         try:
@@ -1180,32 +1292,14 @@ async def upload_contract(
                 contract_id,
             )
         except Exception as error:
+            logger.exception(
+                "Pipeline ingestion failed",
+                extra={"source_filename": upload.filename or contract_id},
+            )
             raise HTTPException(
                 status_code=500,
-                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}: {error}",
+                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}.",
             ) from error
-
-        try:
-            text = await run_in_threadpool(_extract_text, upload.filename or "contract.txt", file_bytes)
-            if text.strip():
-                RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-                raw_text_path = RAW_UPLOAD_DIR / f"{contract_id}.txt"
-                raw_text_path.write_text(text, encoding="utf-8")
-
-                splitter = build_splitter()
-                chunks = chunk_contract(
-                    {
-                        "contract_name": contract_id,
-                        "contract_text": text,
-                        "clause_type": "uploaded_contract",
-                    },
-                    splitter=splitter,
-                )
-                if chunks:
-                    legacy_chunks_to_append.extend(chunks)
-        except Exception:
-            # Ignore legacy indexing prep errors; primary pipeline indexing already succeeded.
-            pass
 
         upload_results.append(
             UploadItemResponse(
@@ -1216,35 +1310,26 @@ async def upload_contract(
             )
         )
 
-    legacy_status = "Legacy FAISS/BM25 index updated for /query compatibility."
-    try:
-        if legacy_chunks_to_append:
-            _append_chunks(legacy_chunks_to_append)
-            retriever = await run_in_threadpool(_rebuild_indexes)
-            app_lock = getattr(request.app.state, "agent_lock", None)
-            if app_lock is None:
-                request.app.state.agent_lock = asyncio.Lock()
-                app_lock = request.app.state.agent_lock
-            async with app_lock:
-                request.app.state.hybrid_retriever = retriever
-                request.app.state.agent = LegalContractAgent(hybrid_retriever=retriever)
-        else:
-            legacy_status = "Legacy index update skipped: no legacy chunks were produced."
-    except Exception as error:
-        legacy_status = f"Legacy index update skipped: {error}"
+    await run_in_threadpool(
+        chat_scope_registry.add_contracts,
+        resolved_chat_id,
+        [item.contract_id for item in upload_results],
+    )
 
     if len(upload_results) == 1:
         single = upload_results[0]
         return UploadResponse(
+            chat_id=resolved_chat_id,
             contract_id=single.contract_id,
             chunks_ingested=single.chunks_ingested,
-            message=f"{single.message} {legacy_status}",
+            message=single.message,
         )
 
     return UploadBatchResponse(
+        chat_id=resolved_chat_id,
         uploads=upload_results,
         total_files=len(upload_results),
-        message=f"Indexed {len(upload_results)} files. {legacy_status}",
+        message=f"Indexed {len(upload_results)} files using the unified Chroma pipeline.",
     )
 
 
@@ -1252,7 +1337,6 @@ async def upload_contract(
 # FILE: src/api/schemas.py
 ################################################################################
 
-from __future__ import annotations
 
 from typing import Any
 
@@ -1276,6 +1360,7 @@ class SourceReference(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3)
     contract_id: str | None = None
+    chat_id: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -1294,9 +1379,11 @@ class AskRequest(QueryRequest):
     @model_validator(mode="before")
     @classmethod
     def _coerce_question_alias(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "query" not in value and "question" in value:
+        if isinstance(value, dict):
             normalized = dict(value)
-            normalized["query"] = normalized.get("question")
+            if "query" not in normalized and "question" in normalized:
+                normalized["query"] = normalized.get("question")
+            normalized.pop("question", None)
             return normalized
         return value
 
@@ -1307,6 +1394,7 @@ class AskResponse(QueryResponse):
 
 
 class UploadResponse(BaseModel):
+    chat_id: str
     contract_id: str
     chunks_ingested: int
     message: str
@@ -1320,6 +1408,7 @@ class UploadItemResponse(BaseModel):
 
 
 class UploadBatchResponse(BaseModel):
+    chat_id: str
     uploads: list[UploadItemResponse]
     total_files: int
     message: str
@@ -1364,20 +1453,20 @@ class MetricsResponse(BaseModel):
 """Evaluation layer for RAG metrics and metric persistence."""
 
 from src.evaluation.metrics_store import MetricsStore
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator, RagasEvaluator
 
-__all__ = ["MetricsStore", "RagasEvaluator"]
+__all__ = ["MetricsStore", "ContractQAEvaluator", "RagasEvaluator"]
 
 
 ################################################################################
 # FILE: src/evaluation/metrics_store.py
 ################################################################################
 
-from __future__ import annotations
 
 import os
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 try:
@@ -1388,7 +1477,46 @@ try:
 except Exception:
     SQLALCHEMY_AVAILABLE = False
 
+from src.utils.db import should_auto_create_tables
+
 DEFAULT_DATABASE_URL = "sqlite:///data/processed/metrics.db"
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+
+    raw_path = database_url[len(prefix):].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        return
+
+    try:
+        Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _as_utc_naive(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    return parsed
+                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 if SQLALCHEMY_AVAILABLE:
@@ -1434,6 +1562,7 @@ class MetricsStore:
         self._lock = threading.Lock()
         self.database_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
         if SQLALCHEMY_AVAILABLE:
+            _ensure_sqlite_parent_dir(self.database_url)
             self.engine = create_engine(self.database_url, future=True)
             self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
         else:
@@ -1441,7 +1570,7 @@ class MetricsStore:
             self.SessionLocal = None
 
     def init_db(self) -> None:
-        if SQLALCHEMY_AVAILABLE:
+        if SQLALCHEMY_AVAILABLE and should_auto_create_tables(self.database_url):
             Base.metadata.create_all(bind=self.engine)
 
     def save_metric(self, payload: dict[str, Any]) -> int:
@@ -1456,7 +1585,7 @@ class MetricsStore:
                     answer_relevance=float(payload.get("answer_relevance", 0.0)),
                     context_precision=float(payload.get("context_precision", 0.0)),
                     context_recall=float(payload.get("context_recall", 0.0)),
-                    created_at=payload.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None)),
+                    created_at=_as_utc_naive(payload.get("created_at")),
                 )
                 session.add(row)
                 session.commit()
@@ -1474,7 +1603,7 @@ class MetricsStore:
                 "answer_relevance": float(payload.get("answer_relevance", 0.0)),
                 "context_precision": float(payload.get("context_precision", 0.0)),
                 "context_recall": float(payload.get("context_recall", 0.0)),
-                "created_at": payload.get("created_at", datetime.now(timezone.utc)),
+                "created_at": _as_utc_naive(payload.get("created_at")),
             }
             self._memory_rows.append(row)
         return int(row["id"])
@@ -1490,7 +1619,7 @@ class MetricsStore:
                 )
                 return [self._to_dict(row) for row in rows]
 
-        sorted_rows = sorted(self._memory_rows, key=lambda row: row["created_at"], reverse=True)
+        sorted_rows = sorted(self._memory_rows, key=lambda row: _as_utc_naive(row.get("created_at")), reverse=True)
         return [self._to_dict(row) for row in sorted_rows[:limit]]
 
     def get_trends(self, days: int = 7) -> list[dict[str, Any]]:
@@ -1505,8 +1634,8 @@ class MetricsStore:
                 )
                 return [self._to_dict(row) for row in rows]
 
-        rows = [row for row in self._memory_rows if row["created_at"] >= threshold]
-        rows = sorted(rows, key=lambda row: row["created_at"])
+        rows = [row for row in self._memory_rows if _as_utc_naive(row.get("created_at")) >= threshold]
+        rows = sorted(rows, key=lambda row: _as_utc_naive(row.get("created_at")))
         return [self._to_dict(row) for row in rows]
 
     def get_query_analytics(self) -> list[dict[str, Any]]:
@@ -1557,11 +1686,7 @@ class MetricsStore:
     @staticmethod
     def _to_dict(row: RagasMetricLog) -> dict[str, Any]:
         if isinstance(row, dict):
-            created_at = row.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None))
-            if isinstance(created_at, str):
-                created_iso = created_at
-            else:
-                created_iso = created_at.isoformat()
+            created_iso = _as_utc_naive(row.get("created_at")).isoformat()
             return {
                 "id": int(row.get("id", 0)),
                 "query": str(row.get("query", "")),
@@ -1593,7 +1718,6 @@ class MetricsStore:
 # FILE: src/evaluation/ragas_evaluator.py
 ################################################################################
 
-from __future__ import annotations
 
 import json
 import math
@@ -1721,8 +1845,27 @@ def _coerce_metric(payload: dict[str, Any], key: str) -> float:
     return round(max(0.0, min(1.0, value)), 4)
 
 
+def _split_sentences(text: str) -> list[str]:
+    return [segment.strip() for segment in re.split(r"(?<=[.!?])\s+|\n+", text) if segment.strip()]
+
+
+def _sentence_support(sentence: str, contexts: list[str]) -> float:
+    sentence_tokens = tokenize(sentence)
+    if not sentence_tokens:
+        return 0.0
+
+    best = 0.0
+    for context in contexts:
+        context_tokens = tokenize(context)
+        overlap = len(sentence_tokens & context_tokens)
+        support = safe_divide(overlap, len(sentence_tokens))
+        if support > best:
+            best = support
+    return best
+
+
 @dataclass
-class OllamaLLM:
+class OllamaJudge:
     model: str = "mistral"
     endpoint: str = "http://localhost:11434/api/generate"
     timeout_seconds: float = 90.0
@@ -1808,11 +1951,19 @@ class EvalSample:
     ground_truth: str
 
 
-class RagasEvaluator:
-    def __init__(self, use_ragas: bool = True) -> None:
+class ContractQAEvaluator:
+    def __init__(
+        self,
+        use_llm_judge: bool = True,
+        use_ragas: bool | None = None,
+    ) -> None:
+        # Preserve backward compatibility with existing call sites using use_ragas.
+        if use_ragas is not None:
+            use_llm_judge = bool(use_ragas)
+
+        self.use_llm_judge = use_llm_judge
         self._semantic_model_name = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        self.use_ragas = use_ragas
-        self._ollama = OllamaLLM(
+        self._ollama = OllamaJudge(
             model=os.getenv("OLLAMA_MODEL", "mistral"),
             endpoint=os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"),
             timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")),
@@ -1825,22 +1976,23 @@ class RagasEvaluator:
         contexts: list[str],
         ground_truth: str = "",
     ) -> dict[str, Any]:
+        reference_scores = self._evaluate_reference(question, answer, contexts, ground_truth)
         fallback_reason = ""
 
-        if self.use_ragas:
+        if self.use_llm_judge:
             try:
-                ollama_scores = self._ollama.score(question, answer, contexts, ground_truth)
-                if self._metrics_are_finite(ollama_scores):
-                    ollama_scores["score_source"] = "ollama_mistral"
-                    return ollama_scores
+                llm_scores = self._ollama.score(question, answer, contexts, ground_truth)
+                if self._metrics_are_finite(llm_scores):
+                    merged = self._merge_scores(reference=reference_scores, llm=llm_scores)
+                    merged["score_source"] = "blended_llm_semantic"
+                    return merged
             except (Exception, KeyboardInterrupt) as error:
                 fallback_reason = str(error)
 
-        fallback_scores = self._evaluate_heuristic(question, answer, contexts, ground_truth)
-        fallback_scores["score_source"] = "semantic_fallback"
+        reference_scores["score_source"] = "semantic_reference"
         if fallback_reason:
-            fallback_scores["fallback_reason"] = fallback_reason[:300]
-        return fallback_scores
+            reference_scores["fallback_reason"] = fallback_reason[:300]
+        return reference_scores
 
     @staticmethod
     def _metrics_are_finite(metrics: dict[str, float]) -> bool:
@@ -1855,6 +2007,20 @@ class RagasEvaluator:
             except Exception:
                 return False
         return True
+
+    @staticmethod
+    def _merge_scores(reference: dict[str, float], llm: dict[str, float]) -> dict[str, float]:
+        # Faithfulness is anchored by deterministic support so ungrounded LLM scoring
+        # cannot drift too far upward.
+        blended_faithfulness = (0.65 * reference["faithfulness"]) + (0.35 * llm["faithfulness"])
+        capped_faithfulness = min(blended_faithfulness, reference["faithfulness"] + 0.15)
+
+        return {
+            "faithfulness": round(max(0.0, min(1.0, capped_faithfulness)), 4),
+            "answer_relevance": round((0.5 * reference["answer_relevance"]) + (0.5 * llm["answer_relevance"]), 4),
+            "context_precision": round((0.5 * reference["context_precision"]) + (0.5 * llm["context_precision"]), 4),
+            "context_recall": round((0.5 * reference["context_recall"]) + (0.5 * llm["context_recall"]), 4),
+        }
 
     def evaluate_batch(self, samples: list[EvalSample]) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
@@ -1885,7 +2051,7 @@ class RagasEvaluator:
             "context_recall": mean(float(item["context_recall"]) for item in results),
         }
 
-    def _evaluate_heuristic(
+    def _evaluate_reference(
         self,
         question: str,
         answer: str,
@@ -1893,14 +2059,17 @@ class RagasEvaluator:
         ground_truth: str,
     ) -> dict[str, float]:
         context_blob = "\n".join(contexts)
-        answer_sentences = [segment.strip() for segment in re.split(r"[.!?]", answer) if segment.strip()]
+        answer_sentences = _split_sentences(answer)
 
-        if answer_sentences:
-            sentence_support_scores = [
+        if answer_sentences and contexts:
+            support_scores = [_sentence_support(sentence, contexts) for sentence in answer_sentences]
+            semantic_support_scores = [
                 semantic_similarity(sentence, context_blob, model_name=self._semantic_model_name)
                 for sentence in answer_sentences
             ]
-            faithfulness_score = mean(sentence_support_scores)
+            support_faithfulness = mean(support_scores)
+            semantic_faithfulness = mean(semantic_support_scores)
+            faithfulness_score = (0.7 * support_faithfulness) + (0.3 * semantic_faithfulness)
         else:
             faithfulness_score = 0.0
 
@@ -1917,18 +2086,21 @@ class RagasEvaluator:
             context_recall_score = min(1.0, context_precision_score + 0.05)
 
         return {
-            "faithfulness": round(faithfulness_score, 4),
+            "faithfulness": round(max(0.0, min(1.0, faithfulness_score)), 4),
             "answer_relevance": round(answer_relevance_score, 4),
             "context_precision": round(context_precision_score, 4),
             "context_recall": round(context_recall_score, 4),
         }
 
 
+# Backward compatible alias so existing imports continue to work.
+RagasEvaluator = ContractQAEvaluator
+
+
 ################################################################################
 # FILE: src/evaluation/run_eval.py
 ################################################################################
 
-from __future__ import annotations
 
 import argparse
 import json
@@ -1944,7 +2116,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(project_root))
 
 from src.evaluation.metrics_store import MetricsStore
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
 from src.ingestion.loader import load_cuad_dataset, normalize_row
 
 DEFAULT_EVAL_PATH = Path("data/eval_samples/cuad_eval_samples.jsonl")
@@ -2191,7 +2363,7 @@ def main() -> None:
             "metrics may be conservative."
         )
 
-    evaluator = RagasEvaluator(use_ragas=True)
+    evaluator = ContractQAEvaluator(use_llm_judge=True)
     store = MetricsStore()
     store.init_db()
 
@@ -2248,7 +2420,6 @@ __all__ = [
 # FILE: src/ingestion/chunker.py
 ################################################################################
 
-from __future__ import annotations
 
 import argparse
 import json
@@ -2436,7 +2607,6 @@ if __name__ == "__main__":
 # FILE: src/ingestion/embedder.py
 ################################################################################
 
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -2480,7 +2650,6 @@ from src.ingestion.chunker import DEFAULT_OUTPUT_PATH, build_chunks_from_cuad, s
 
 DEFAULT_FAISS_DIR = Path("data/processed/faiss_index")
 DEFAULT_METADATA_PATH = Path("data/processed/chunk_metadata.json")
-DEFAULT_BM25_PATH = Path("data/processed/bm25_index.pkl")
 
 
 load_dotenv()
@@ -2501,6 +2670,27 @@ def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2
         return HuggingFaceInferenceAPIEmbeddings(**embedding_kwargs)
 
     return get_hash_embeddings()
+
+
+def _is_valid_vector(value: Any) -> bool:
+    try:
+        vector = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return False
+
+    if vector.ndim != 1 or vector.size == 0:
+        return False
+
+    return bool(np.isfinite(vector).all())
+
+
+def _embedding_backend_healthy(embeddings: Embeddings) -> bool:
+    try:
+        probe = embeddings.embed_query("embedding healthcheck")
+    except Exception:
+        return False
+
+    return _is_valid_vector(probe)
 
 
 def load_chunks(chunks_path: Path = DEFAULT_OUTPUT_PATH) -> list[dict[str, Any]]:
@@ -2527,6 +2717,12 @@ def build_faiss_index(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     embeddings = resolve_embeddings(model_name=model_name)
+    if not _embedding_backend_healthy(embeddings):
+        print(
+            "Embedding backend returned an invalid probe vector. "
+            "Falling back to deterministic hash embeddings."
+        )
+        embeddings = get_hash_embeddings()
 
     texts = [chunk["text"] for chunk in chunks]
     metadatas = []
@@ -2535,7 +2731,19 @@ def build_faiss_index(
         metadata["chunk_id"] = chunk.get("chunk_id")
         metadatas.append(metadata)
 
-    vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+    try:
+        vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+    except Exception as exc:
+        if isinstance(embeddings, HashEmbeddings):
+            raise
+
+        print(
+            f"Primary embedding backend failed during index build ({exc}). "
+            "Retrying with deterministic hash embeddings."
+        )
+        embeddings = get_hash_embeddings()
+        vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+
     vector_store.save_local(str(output_dir))
     return output_dir
 
@@ -2553,14 +2761,6 @@ def save_metadata(chunks: list[dict[str, Any]], output_path: Path = DEFAULT_META
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
 
-    return output_path
-
-
-def build_sparse_index(chunks: list[dict[str, Any]], output_path: Path = DEFAULT_BM25_PATH) -> Path:
-    from src.retrieval.sparse_retriever import build_and_save_bm25
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    build_and_save_bm25(chunks=chunks, output_path=output_path)
     return output_path
 
 
@@ -2584,7 +2784,7 @@ def upload_faiss_to_s3(index_dir: Path, bucket: str, key: str, region: str) -> s
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build FAISS and BM25 indexes from processed chunks.")
+    parser = argparse.ArgumentParser(description="Build a FAISS index from processed chunks.")
     parser.add_argument("--chunks", default=str(DEFAULT_OUTPUT_PATH), help="Path to chunked JSONL file")
     parser.add_argument("--faiss-dir", default=str(DEFAULT_FAISS_DIR), help="Path to save FAISS index")
     parser.add_argument("--metadata", default=str(DEFAULT_METADATA_PATH), help="Path to save chunk metadata")
@@ -2605,11 +2805,9 @@ def main() -> None:
 
     faiss_dir = build_faiss_index(chunks=chunks, output_dir=Path(args.faiss_dir), model_name=args.embedding_model)
     metadata_path = save_metadata(chunks=chunks, output_path=Path(args.metadata))
-    bm25_path = build_sparse_index(chunks=chunks)
 
     print(f"Saved FAISS index to {faiss_dir}")
     print(f"Saved metadata to {metadata_path}")
-    print(f"Saved BM25 index to {bm25_path}")
 
     if args.upload_s3:
         bucket = os.getenv("S3_FAISS_BUCKET", "")
@@ -2627,20 +2825,19 @@ if __name__ == "__main__":
 # FILE: src/ingestion/loader.py
 ################################################################################
 
-from __future__ import annotations
 
 import argparse
 import json
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 try:
-    from datasets import Dataset, __version__ as DATASETS_VERSION, load_dataset
+    from datasets import Dataset as DatasetType, __version__ as DATASETS_VERSION, load_dataset
 
     DATASETS_SUPPORTS_TRUST_REMOTE_CODE = int(DATASETS_VERSION.split(".")[0]) < 4
 except Exception:
-    Dataset = Any  # type: ignore[assignment]
+    DatasetType: TypeAlias = Any
     DATASETS_SUPPORTS_TRUST_REMOTE_CODE = False
 
     def load_dataset(*args, **kwargs):  # type: ignore[no-redef]
@@ -2675,7 +2872,7 @@ ANSWER_FIELD_CANDIDATES = ("answers", "answer", "ground_truth")
 MAX_PDF_PAGES = 80
 
 
-def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "no_checks") -> Dataset:
+def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "no_checks") -> DatasetType:
     """Load datasets with compatibility across datasets library versions."""
     try:
         return load_dataset(dataset_id, split=split, verification_mode=verification_mode)
@@ -2697,7 +2894,7 @@ def _load_dataset_compat(dataset_id: str, split: str, verification_mode: str = "
             raise load_error
 
 
-def load_cuad_dataset(dataset_id: str = PRIMARY_DATASET_ID, split: str = DEFAULT_SPLIT) -> Dataset:
+def load_cuad_dataset(dataset_id: str = PRIMARY_DATASET_ID, split: str = DEFAULT_SPLIT) -> DatasetType:
     """Load CUAD from HuggingFace with a fallback dataset id."""
     try:
         if dataset_id == PRIMARY_DATASET_ID:
@@ -2862,7 +3059,7 @@ def normalize_row(row: dict[str, Any], row_index: int) -> dict[str, Any]:
     }
 
 
-def save_raw_rows(dataset: Dataset, output_path: Path = RAW_OUTPUT_PATH) -> Path:
+def save_raw_rows(dataset: DatasetType, output_path: Path = RAW_OUTPUT_PATH) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         for row_index, row in enumerate(dataset):
@@ -2871,7 +3068,7 @@ def save_raw_rows(dataset: Dataset, output_path: Path = RAW_OUTPUT_PATH) -> Path
     return output_path
 
 
-def build_contract_records(dataset: Dataset) -> list[dict[str, Any]]:
+def build_contract_records(dataset: DatasetType) -> list[dict[str, Any]]:
     """Group question-centric CUAD rows into unique contract documents."""
     grouped: dict[str, dict[str, Any]] = {}
 
@@ -2936,90 +3133,89 @@ if __name__ == "__main__":
 # FILE: src/monitoring/dashboard.py
 ################################################################################
 
-from __future__ import annotations
+import os
 
 import pandas as pd
 import streamlit as st
-
 from src.evaluation.metrics_store import MetricsStore
+
+try:
+    from streamlit.errors import StreamlitAPIException
+except Exception:
+    StreamlitAPIException = Exception  # type: ignore[assignment]
 
 FAITHFULNESS_ALERT_THRESHOLD = 0.90
 
-st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
-st.title("Legal Contract Analyzer - Monitoring Dashboard")
-st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
 
-store = MetricsStore()
-store.init_db()
+def _safe_set_page_config() -> None:
+    try:
+        st.set_page_config(page_title="Legal RAG Monitoring", layout="wide")
+    except StreamlitAPIException:
+        # Streamlit allows set_page_config only once per run.
+        pass
 
-col_a, col_b = st.columns([2, 1])
-with col_b:
-    days = st.slider("Lookback (days)", min_value=1, max_value=30, value=7)
-    limit = st.slider("Recent records", min_value=10, max_value=200, value=50, step=10)
+def main() -> None:
+    _safe_set_page_config()
+    st.title("Legal Contract Analyzer - Monitoring Dashboard")
+    st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
 
-trends = store.get_trends(days=days)
-recent = store.list_recent(limit=limit)
-analytics = store.get_query_analytics()
+    store = MetricsStore(database_url=os.getenv("DATABASE_URL"))
+    trends = store.get_trends(days=7)
+    if not trends:
+        st.info("No recent metrics available to display.")
+        return
 
-trends_df = pd.DataFrame(trends)
-recent_df = pd.DataFrame(recent)
-analytics_df = pd.DataFrame(analytics)
+    df = pd.DataFrame(trends)
+    if df.empty:
+        st.info("No data rows available in trends.")
+        return
 
-if not recent_df.empty:
-    latest = recent_df.iloc[0]
-    latest_faithfulness = float(latest.get("faithfulness", 0.0))
-    if latest_faithfulness < FAITHFULNESS_ALERT_THRESHOLD:
-        st.error(
-            "Alert: faithfulness dropped below threshold "
-            f"({latest_faithfulness:.2f} < {FAITHFULNESS_ALERT_THRESHOLD:.2f})"
+    df["created_at"] = pd.to_datetime(df["created_at"])
+    time_series = df.set_index("created_at")
+
+    st.subheader("Quality Score Trends (Last 7 Days)")
+    metrics_to_plot = ["faithfulness", "answer_relevance", "context_precision", "context_recall"]
+    st.line_chart(time_series[metrics_to_plot])
+
+    st.subheader("Current Averages")
+    cols = st.columns(4)
+    cols[0].metric("Avg Faithfulness", f"{df['faithfulness'].mean():.2f}")
+    cols[1].metric("Avg Relevance", f"{df['answer_relevance'].mean():.2f}")
+    cols[2].metric("Avg Precision", f"{df['context_precision'].mean():.2f}")
+    cols[3].metric("Avg Recall", f"{df['context_recall'].mean():.2f}")
+
+    faithfulness_mean = df['faithfulness'].mean()
+    if faithfulness_mean < FAITHFULNESS_ALERT_THRESHOLD:
+        st.warning(
+            f"Alert: Average faithfulness ({faithfulness_mean:.2f}) is below threshold "
+            f"({FAITHFULNESS_ALERT_THRESHOLD:.2f})."
         )
+
+    st.subheader("Recent Queries")
+    recent = store.list_recent(limit=10)
+    recent_df = pd.DataFrame(recent)
+    if not recent_df.empty:
+        display_columns = ["id", "query", "tool_used", "faithfulness", "answer_relevance"]
+        st.dataframe(recent_df[display_columns], use_container_width=True, hide_index=True)
+
+    st.subheader("Query Analytics")
+    analytics = store.get_query_analytics()
+    analytics_df = pd.DataFrame(analytics)
+    if analytics_df.empty:
+        st.info("No analytics available yet.")
     else:
-        st.success(
-            "Faithfulness is healthy "
-            f"({latest_faithfulness:.2f} >= {FAITHFULNESS_ALERT_THRESHOLD:.2f})"
-        )
+        analytics_plot = analytics_df.set_index("tool_used")[['count', 'avg_faithfulness']]
+        st.bar_chart(analytics_plot)
+        st.dataframe(analytics_df, use_container_width=True, hide_index=True)
 
-with col_a:
-    st.subheader("RAGAs Trend (Last N Days)")
-    if trends_df.empty:
-        st.info("No metrics logged yet. Submit queries via API/UI to populate this chart.")
-    else:
-        trends_df["created_at"] = pd.to_datetime(trends_df["created_at"])
-        plot_df = trends_df[
-            ["created_at", "faithfulness", "answer_relevance", "context_precision", "context_recall"]
-        ].set_index("created_at")
-        st.line_chart(plot_df)
-
-st.subheader("Recent Query Metrics")
-if recent_df.empty:
-    st.info("No recent query records available.")
-else:
-    display_columns = [
-        "created_at",
-        "tool_used",
-        "used_web_fallback",
-        "faithfulness",
-        "answer_relevance",
-        "context_precision",
-        "context_recall",
-        "query",
-    ]
-    st.dataframe(recent_df[display_columns], use_container_width=True, hide_index=True)
-
-st.subheader("Query Analytics")
-if analytics_df.empty:
-    st.info("No analytics available yet.")
-else:
-    analytics_plot = analytics_df.set_index("tool_used")[["count", "avg_faithfulness"]]
-    st.bar_chart(analytics_plot)
-    st.dataframe(analytics_df, use_container_width=True, hide_index=True)
+if __name__ == "__main__":
+    main()
 
 
 ################################################################################
 # FILE: src/pipeline/__init__.py
 ################################################################################
 
-from __future__ import annotations
 
 from src.pipeline.pipeline import ContractQAPipeline
 
@@ -3030,7 +3226,6 @@ __all__ = ["ContractQAPipeline"]
 # FILE: src/pipeline/answerer.py
 ################################################################################
 
-from __future__ import annotations
 
 import os
 import re
@@ -3044,39 +3239,11 @@ try:
 except Exception:
     requests = None
 
-
-_NUMBER_WORDS: dict[str, int] = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-}
-
-
-def _render_context(chunks: list[dict[str, Any]], max_chars_per_chunk: int = 1500) -> str:
-    lines: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
-        metadata = dict(chunk.get("metadata", {}))
-        chunk_id = str(chunk.get("chunk_id", metadata.get("chunk_id", f"chunk_{index}")))
-        contract_name = str(metadata.get("contract_name", metadata.get("contract_id", "unknown_contract")))
-        clause_type = str(metadata.get("clause_type", "general"))
-        page_number = metadata.get("page_number")
-        section_heading = str(metadata.get("section_heading", ""))
-        text = str(chunk.get("text", "")).strip()
-
-        prefix = (
-            f"[{index}] chunk_id={chunk_id} contract={contract_name} "
-            f"clause={clause_type} page={page_number} heading={section_heading}"
-        )
-        lines.append(f"{prefix}\n{text[:max_chars_per_chunk]}")
-
-    return "\n\n".join(lines)
+from src.pipeline.answerer_helpers import (
+    build_answer_prompt,
+    build_extractive_fallback_answer,
+    normalize_answer,
+)
 
 
 @dataclass
@@ -3090,10 +3257,21 @@ class MistralAnswerer:
         if not source_chunks:
             return "This contract does not contain a clause addressing that."
 
-        prompt = self._build_prompt(question=question, source_chunks=source_chunks)
+        prompt = build_answer_prompt(question=question, source_chunks=source_chunks)
 
+        generated = self._answer_with_http(prompt=prompt)
+        if generated:
+            return generated
+
+        generated = self._answer_with_ollama_cli(prompt=prompt)
+        if generated:
+            return generated
+
+        return build_extractive_fallback_answer(question=question, source_chunks=source_chunks)
+
+    def _answer_with_http(self, prompt: str) -> str:
         if requests is None:
-            return "Could not reach the configured model backend to generate an answer."
+            return ""
 
         try:
             payload = {
@@ -3105,435 +3283,9 @@ class MistralAnswerer:
             response = requests.post(self.endpoint, json=payload, timeout=max(30.0, self.timeout_seconds))
             response.raise_for_status()
             body = response.json()
-            answer = str(body.get("response", "")).strip()
-            if answer:
-                return answer
-        except Exception as error:
-            cli_answer = self._answer_with_ollama_cli(prompt=prompt)
-            if cli_answer:
-                return cli_answer
-            return self._build_extractive_fallback_answer(question=question, source_chunks=source_chunks)
-
-        cli_answer = self._answer_with_ollama_cli(prompt=prompt)
-        if cli_answer:
-            return cli_answer
-
-        return self._build_extractive_fallback_answer(question=question, source_chunks=source_chunks)
-
-    def finalize_answer_with_sources(
-        self,
-        answer: str,
-        source_chunks: list[dict[str, Any]],
-        question: str = "",
-    ) -> tuple[str, list[dict[str, Any]]]:
-        sources = self.build_sources(source_chunks)
-        if not sources:
-            return answer.strip(), []
-
-        cleaned = self._normalize_answer(answer=answer, question=question, source_chunks=source_chunks)
-        if not re.search(r"\[\d+\]", cleaned):
-            cleaned = f"{cleaned} [{sources[0]['index']}]"
-
-        source_lines = "\n".join(f"[{item['index']}] {item['label']}" for item in sources)
-        tagged_answer = f"{cleaned}\n\nSources:\n{source_lines}"
-        return tagged_answer, sources
-
-    def _build_prompt(self, question: str, source_chunks: list[dict[str, Any]]) -> str:
-        # Use a wider retrieval window with chunk metadata so clause-specific questions
-        # (for example termination/default/notice) are less likely to miss the right section.
-        context = _render_context(chunks=source_chunks[:12], max_chars_per_chunk=1200)
-        return (
-            "<s>[INST] You are an expert legal contract analysis assistant with deep knowledge of contract law and interpretation.\n\n"
-            "Your task is to answer questions about contracts using ONLY the provided contract excerpts.\n\n"
-            "If the answer to the question is not contained in the provided context, \n"
-            "respond exactly with: \"This information is not specified in the contract.\"\n"
-            "Do NOT infer, guess, or extrapolate answers not explicitly stated.\n\n"
-            "═══════════════════════════════════════\n"
-            "CORE ANSWERING PRINCIPLES\n"
-            "═══════════════════════════════════════\n\n"
-            "DIRECTNESS\n"
-            "- Lead every answer with the direct contract statement or fact.\n"
-            "- Never open with meta-commentary about what the contract does or does not say before giving the answer.\n"
-            "- If the answer exists in the excerpts, state it plainly first, then add context.\n"
-            "- Reserve \"This contract does not address [topic].\" for when excerpts genuinely contain nothing relevant.\n\n"
-            "PRECISION\n"
-            "- Answer only what is asked. Do not include information from adjacent provisions unless it directly qualifies the answer.\n"
-            "- If asked about a threshold, answer with the threshold. If asked about a process, answer with the process. Do not conflate the two.\n"
-            "- Distinguish between SHALL (mandatory), MAY (permissive), and MUST NOT (prohibited) when citing obligations.\n\n"
-            "COMPLETENESS\n"
-            "- For list-type questions (conditions, types, thresholds, requirements), retrieve ALL instances from the excerpts.\n"
-            "- If multiple sections address the same topic, synthesize them into a single coherent answer rather than listing chunks separately.\n"
-            "- Do not stop at the first relevant clause if others exist.\n\n"
-            "CONFIDENCE CALIBRATION\n"
-            "- State contract language as fact when it is direct and unambiguous.\n"
-            "- Use \"may\" or \"could\" only when the contract itself uses permissive language.\n"
-            "- Do not introduce your own uncertainty into unambiguous contract statements.\n"
-            "- When genuinely uncertain due to ambiguous language, quote the relevant contract text and note the ambiguity — do not silently guess.\n\n"
-            "═══════════════════════════════════════\n"
-            "STRUCTURE & FORMATTING\n"
-            "═══════════════════════════════════════\n\n"
-            "- Lead with a one-sentence direct answer when the question has a clear single answer.\n"
-            "- Use a numbered list when the answer has multiple components (conditions, steps, types).\n"
-            "- Do not introduce a list with \"The contract contains X items\" — just begin the list.\n"
-            "- Do not number a list if there is only one item — state it as a sentence.\n"
-            "- Use bold for key terms, amounts, deadlines, and named parties when they appear in lists.\n"
-            "- Keep answers as short as the question allows. Add detail only when it materially affects the answer.\n\n"
-            "═══════════════════════════════════════\n"
-            "CITATION RULES\n"
-            "═══════════════════════════════════════\n\n"
-            "- Cite every factual claim with a bracket reference: [1], [2], etc.\n"
-            "- Place citations at the end of the sentence they support, not at the end of the answer.\n"
-            "- If two sources support the same claim, cite both: [1][2].\n"
-            "- If a claim spans multiple sections that say the same thing, note the primary source and acknowledge the others briefly.\n"
-            "- Never cite a source for a claim it does not support.\n\n"
-            "═══════════════════════════════════════\n"
-            "SCOPE & BOUNDARIES\n"
-            "═══════════════════════════════════════\n\n"
-            "- Use ONLY the provided excerpts. Do not apply general legal knowledge to fill gaps.\n"
-            "- Do not infer obligations from silence. If the contract is silent on something, say so.\n"
-            "- Do not speculate about what parties intended beyond what the text states.\n"
-            "- If the excerpts appear incomplete or contradictory, note this explicitly rather than resolving it silently.\n"
-            "- Never claim your answer covers all contract provisions unless the excerpts clearly include every relevant section. End with: \"Other provisions elsewhere in the contract may also apply.\" when appropriate.\n\n"
-            "═══════════════════════════════════════\n"
-            "QUESTION-TYPE HANDLING\n"
-            "═══════════════════════════════════════\n\n"
-            "THRESHOLD / VALUE QUESTIONS (e.g. \"What triggers X?\")\n"
-            "→ List all monetary thresholds and conditions found across all excerpts.\n"
-            "→ Distinguish between different thresholds that trigger different obligations.\n\n"
-            "PROCESS / PROCEDURE QUESTIONS (e.g. \"What is the process for X?\")\n"
-            "→ Present steps in sequential order if sequence matters.\n"
-            "→ Clearly separate parallel tracks (e.g. audit disputes vs. general disputes).\n\n"
-            "PERMISSION / PROHIBITION QUESTIONS (e.g. \"Can X do Y?\")\n"
-            "→ State the answer (yes/no/conditional) in the first sentence.\n"
-            "→ Then cite the specific clause that establishes this.\n"
-            "→ Note any exceptions or conditions that modify the answer.\n\n"
-            "OWNERSHIP / RIGHTS QUESTIONS (e.g. \"Who owns X?\")\n"
-            "→ State the owner directly.\n"
-            "→ Note any licenses, exceptions, or residual rights that qualify ownership.\n\n"
-            "OBLIGATION QUESTIONS (e.g. \"What must X do?\")\n"
-            "→ Distinguish between unconditional obligations (SHALL) and conditional ones (IF... THEN).\n"
-            "→ List unconditional obligations first.\n\n"
-            "TIMELINE / DEADLINE QUESTIONS (e.g. \"When must X happen?\")\n"
-            "→ State the specific deadline or trigger event.\n"
-            "→ If multiple deadlines exist for the same topic, distinguish them clearly (e.g. interim vs. final).\n\n"
-            "PERSONNEL / ROLE QUESTIONS (e.g. \"Who is responsible for X?\")\n"
-            "→ Name the specific person or role.\n"
-            "→ Note any approval or consent requirements that apply to changes in that role.\n\n"
-            "═══════════════════════════════════════\n"
-            "ANTI-PATTERNS TO AVOID\n"
-            "═══════════════════════════════════════\n\n"
-            "❌ \"The contract does not explicitly state...\" [when it does]\n"
-            "❌ \"It can be inferred that...\" [use only when inference is genuinely needed]\n"
-            "❌ \"It is evident that...\" [state the fact directly]\n"
-            "❌ \"Based on the provided excerpts...\" [unnecessary preamble]\n"
-            "❌ \"This contract contains X conditions for Y...\" [just list them]\n"
-            "❌ \"It is worth noting that...\" [if worth noting, just note it]\n"
-            "❌ \"However, it is important to note...\" [same issue]\n"
-            "❌ Mixing information from adjacent clauses that do not answer the question\n"
-            "❌ Claiming exhaustiveness when excerpts may be partial\n"
-            "❌ Resolving genuine ambiguity silently without flagging it\n\n"
-            "[CONTRACT EXCERPTS]\n"
-            f"{context}\n\n"
-            "[QUESTION]\n"
-            f"{question.strip()}\n\n"
-            "Answer: [/INST]"
-        )
-
-    @staticmethod
-    def _normalize_answer(answer: str, question: str, source_chunks: list[dict[str, Any]]) -> str:
-        cleaned = answer.strip()
-        cleaned = MistralAnswerer._remove_inconsistent_count_intro(cleaned)
-        cleaned = MistralAnswerer._soften_overconfident_termination_claims(cleaned)
-        cleaned = MistralAnswerer._append_invoice_deadline_clarification(cleaned, question, source_chunks)
-        cleaned = MistralAnswerer._append_key_personnel_clarification(cleaned, question, source_chunks)
-        cleaned = MistralAnswerer._append_subcontracting_clarification(cleaned, question, source_chunks)
-        return cleaned.strip()
-
-    @staticmethod
-    def _remove_inconsistent_count_intro(text: str) -> str:
-        numbered_count = len(re.findall(r"^\s*\d+\.\s", text, flags=re.MULTILINE))
-        if numbered_count < 2:
-            return text
-
-        lines = text.splitlines()
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            match = re.search(
-                r"\bcontains\s+([A-Za-z]+|\d+)\s+(?:conditions?|grounds?|reasons?|ways?)\b",
-                stripped,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                continue
-
-            raw_count = match.group(1).lower()
-            if raw_count.isdigit():
-                declared = int(raw_count)
-            else:
-                declared = _NUMBER_WORDS.get(raw_count, -1)
-
-            if declared > 0 and declared != numbered_count:
-                lines.pop(index)
-            break
-
-        return "\n".join(lines).strip()
-
-    @staticmethod
-    def _soften_overconfident_termination_claims(text: str) -> str:
-        patterns = [
-            r"(?i)\bthis contract does not contain[^.\n]*termination[^.\n]*[.?!]",
-            r"(?i)\bno other[^.\n]*termination[^.\n]*[.?!]",
-        ]
-
-        softened = text
-        for pattern in patterns:
-            softened = re.sub(
-                pattern,
-                "Other termination triggers may exist elsewhere in the contract.",
-                softened,
-            )
-
-        return softened
-
-    @staticmethod
-    def _append_invoice_deadline_clarification(
-        text: str,
-        question: str,
-        source_chunks: list[dict[str, Any]],
-    ) -> str:
-        lowered_question = question.lower()
-        payment_deadline_terms = ("invoice", "billing", "submit", "deadline", "final invoice")
-        if not any(term in lowered_question for term in payment_deadline_terms):
-            return text
-
-        evidence_blob = MistralAnswerer._compose_evidence_blob(source_chunks)
-        lowered_evidence = evidence_blob.lower()
-
-        has_regular_deadline = bool(
-            re.search(r"\binvoices?\b[^.\n]{0,140}\b45\s+calendar\s+days\b", lowered_evidence)
-            or ("45 calendar days" in lowered_evidence and "invoice" in lowered_evidence)
-        )
-        has_final_deadline = bool(
-            re.search(r"\bfinal\s+invoice\b[^.\n]{0,200}\b60\s+calendar\s+days\b", lowered_evidence)
-            or ("final invoice" in lowered_evidence and "60 calendar days" in lowered_evidence)
-        )
-
-        if has_final_deadline and not has_regular_deadline:
-            lowered_text = text.lower()
-            if "60" in lowered_text and "final invoice" in lowered_text:
-                return text
-
-            clarification = (
-                "The final invoice must be submitted within 60 calendar days after acceptance of the Consultant's work by the Contract Manager."
-            )
-            return f"{text.rstrip()}\n\n- {clarification}"
-
-        if not (has_regular_deadline and has_final_deadline):
-            return text
-
-        lowered_text = text.lower()
-        mentions_45 = "45" in lowered_text and "invoice" in lowered_text
-        mentions_60_final = "60" in lowered_text and "final invoice" in lowered_text
-        if mentions_45 and mentions_60_final:
-            return text
-
-        clarification = (
-            "Important deadline distinction: regular invoices are due within 45 calendar days after the work is performed, "
-            "while the final invoice is due within 60 calendar days after acceptance of the work by the Contract Manager."
-        )
-        return f"{text.rstrip()}\n\n- {clarification}"
-
-    @staticmethod
-    def _append_key_personnel_clarification(
-        text: str,
-        question: str,
-        source_chunks: list[dict[str, Any]],
-    ) -> str:
-        lowered_question = question.lower()
-        if not any(term in lowered_question for term in ("key personnel", "project manager", "replace", "replaced")):
-            return text
-
-        evidence_blob = MistralAnswerer._compose_evidence_blob(source_chunks)
-        lowered_evidence = evidence_blob.lower()
-        additions: list[str] = []
-
-        has_replacement_constraint = bool(
-            re.search(r"\bremoved\s+or\s+replaced\b[^.\n]{0,220}\bprior\s+written\s+consent\b", lowered_evidence)
-            or re.search(r"\bno\s+change\b[^.\n]{0,220}\bproject\s+manager\b[^.\n]{0,220}\bwritten\b", lowered_evidence)
-            or re.search(r"\bproject\s+manager\b[^.\n]{0,180}\bwritten\s+authoriz", lowered_evidence)
-        )
-
-        if has_replacement_constraint:
-            if "prior written consent" not in text.lower():
-                additions.append(
-                    "Key personnel cannot be removed/replaced or have their agreed functions changed without prior written consent."
-                )
-
-        name_role_pairs = MistralAnswerer._extract_name_role_pairs(evidence_blob)
-        if name_role_pairs:
-            lowered_text = text.lower()
-            if not any(name.lower() in lowered_text for name, _ in name_role_pairs):
-                rendered = "; ".join(f"{name} ({role})" for name, role in name_role_pairs[:3])
-                additions.append(f"Named key personnel include: {rendered}.")
-
-        if not additions:
-            return text
-
-        bullet_block = "\n".join(f"- {item}" for item in additions)
-        return f"{text.rstrip()}\n\n{bullet_block}"
-
-    @staticmethod
-    def _extract_name_role_pairs(evidence_blob: str) -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-
-        patterns = [
-            re.compile(
-                r"([A-Z][a-z]+(?:\s+[A-Z]\.)?\s+[A-Z][a-z]+)[^\n0-9]{0,40}?\b(Principal in Charge|Project Manager)\b"
-            ),
-            re.compile(
-                r"([A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z]+)+)[^\n0-9]{0,40}?\b(Principal in Charge|Project Manager)\b"
-            ),
-        ]
-
-        for pattern in patterns:
-            for match in pattern.finditer(evidence_blob):
-                raw_name = " ".join(match.group(1).split())
-                name = MistralAnswerer._canonical_person_name(raw_name)
-                role = match.group(2)
-                key = (name, role)
-                if key in seen:
-                    continue
-                seen.add(key)
-                pairs.append(key)
-
-        return pairs
-
-    @staticmethod
-    def _compose_evidence_blob(source_chunks: list[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for chunk in source_chunks:
-            metadata = dict(chunk.get("metadata", {}))
-            heading = str(metadata.get("section_heading", "")).strip()
-            text = str(chunk.get("text", "")).strip()
-            combined = f"{heading}\n{text}".strip()
-            if combined:
-                parts.append(combined)
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _canonical_person_name(name: str) -> str:
-        tokens = [token for token in name.split() if token]
-        if not tokens:
-            return name
-
-        # Keep the human name portion and drop trailing firm words from table rows.
-        if len(tokens) > 3:
-            tokens = tokens[:3]
-        return " ".join(tokens)
-
-    @staticmethod
-    def _build_extractive_fallback_answer(question: str, source_chunks: list[dict[str, Any]]) -> str:
-        lowered_question = question.lower()
-        query_terms = set(re.findall(r"[a-z]{4,}", lowered_question))
-        is_termination_query = "termination" in lowered_question or "terminate" in lowered_question
-        is_invoice_query = any(term in lowered_question for term in ("invoice", "billing", "payment deadline", "submit invoice"))
-        is_personnel_query = any(term in lowered_question for term in ("key personnel", "project manager", "replace", "replaced"))
-        if is_termination_query:
-            query_terms.update({"terminate", "termination", "cancel", "suspend", "insurance", "kickback"})
-
-        evidence_blob = MistralAnswerer._compose_evidence_blob(source_chunks)
-
-        if is_invoice_query:
-            invoice_bullets = MistralAnswerer._build_invoice_fallback_bullets(evidence_blob)
-            if invoice_bullets:
-                return (
-                    "Model generation is unavailable, so this answer is extracted directly from retrieved contract excerpts.\n"
-                    + "\n".join(f"{index}. {bullet} [1]" for index, bullet in enumerate(invoice_bullets, start=1))
-                )
-
-        if is_personnel_query:
-            personnel_bullets = MistralAnswerer._build_personnel_fallback_bullets(evidence_blob)
-            if personnel_bullets:
-                return (
-                    "Model generation is unavailable, so this answer is extracted directly from retrieved contract excerpts.\n"
-                    + "\n".join(f"{index}. {bullet} [1]" for index, bullet in enumerate(personnel_bullets, start=1))
-                )
-
-        ranked: list[tuple[float, int, str]] = []
-        for chunk_index, chunk in enumerate(source_chunks[:12], start=1):
-            text = str(chunk.get("text", "")).strip()
-            if not text:
-                continue
-
-            for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
-                cleaned = " ".join(sentence.split()).strip()
-                if len(cleaned) < 30:
-                    continue
-                if cleaned[:1].islower():
-                    continue
-                if cleaned.lower().startswith(("or ", "and ", "but ")):
-                    continue
-
-                lowered_sentence = cleaned.lower()
-                overlap = sum(1 for term in query_terms if term in lowered_sentence)
-                if overlap == 0:
-                    continue
-
-                score = float(overlap)
-                if "terminate" in lowered_sentence or "termination" in lowered_sentence:
-                    score += 1.0
-                ranked.append((score, chunk_index, cleaned))
-
-        ranked.sort(key=lambda item: item[0], reverse=True)
-
-        bullets: list[str] = []
-        seen: set[str] = set()
-        for _, _, sentence in ranked:
-            normalized = sentence.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            bullets.append(f"{len(bullets) + 1}. {sentence} [1]")
-            if len(bullets) >= 5:
-                break
-
-        if is_termination_query:
-            trigger_groups = [
-                ("insurance", {"insurance", "coverage"}),
-                ("equal_employment", {"equal employment", "non-discrimination", "discrimin"}),
-                ("kickback", {"kickback", "rebate", "unlawful consideration"}),
-            ]
-            for _, terms in trigger_groups:
-                for _, _, sentence in ranked:
-                    lowered_sentence = sentence.lower()
-                    if not any(term in lowered_sentence for term in terms):
-                        continue
-                    normalized = lowered_sentence
-                    if normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    bullets.append(f"{len(bullets) + 1}. {sentence} [1]")
-                    break
-
-        bullets = bullets[:7]
-
-        if bullets:
-            return (
-                "Model generation is unavailable, so this answer is extracted directly from retrieved contract excerpts.\n"
-                + "\n".join(bullets)
-                + "\nBased on the retrieved excerpts, these are the primary relevant clauses identified."
-            )
-
-        fallback_text = str(source_chunks[0].get("text", "")).strip()
-        if fallback_text:
-            snippet = " ".join(fallback_text.split())[:260]
-            return f"Model generation is unavailable. Closest retrieved excerpt: {snippet} [1]"
-
-        return "This contract does not contain a clause addressing that."
+            return str(body.get("response", "")).strip()
+        except Exception:
+            return ""
 
     def _answer_with_ollama_cli(self, prompt: str) -> str:
         if not self.enable_cli_fallback:
@@ -3563,47 +3315,27 @@ class MistralAnswerer:
         if not stdout:
             return ""
 
-        # Strip ANSI escape sequences if present.
-        cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stdout).strip()
-        return cleaned
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stdout).strip()
 
-    @staticmethod
-    def _build_invoice_fallback_bullets(evidence_blob: str) -> list[str]:
-        lowered = evidence_blob.lower()
-        bullets: list[str] = []
+    def finalize_answer_with_sources(
+        self,
+        answer: str,
+        source_chunks: list[dict[str, Any]],
+        question: str = "",
+    ) -> tuple[str, list[dict[str, Any]]]:
+        sources = self.build_sources(source_chunks)
+        if not sources:
+            return answer.strip(), []
 
-        if "final invoice" in lowered and "60 calendar days" in lowered:
-            bullets.append(
-                "The final invoice must be submitted within 60 calendar days after acceptance of the Consultant's work by the Contract Manager."
-            )
+        cleaned = normalize_answer(answer)
+        if not cleaned and question.strip():
+            cleaned = f"Unable to produce a grounded answer for: {question.strip()}"
+        if not re.search(r"\[\d+\]", cleaned):
+            cleaned = f"{cleaned} [{sources[0]['index']}]"
 
-        if "45 calendar days" in lowered and "invoice" in lowered:
-            bullets.append(
-                "Regular invoices must be submitted no later than 45 calendar days after the performance of work being billed."
-            )
-
-        return bullets
-
-    @staticmethod
-    def _build_personnel_fallback_bullets(evidence_blob: str) -> list[str]:
-        lowered = evidence_blob.lower()
-        bullets: list[str] = []
-
-        pairs = MistralAnswerer._extract_name_role_pairs(evidence_blob)
-        if pairs:
-            rendered = "; ".join(f"{name} ({role})" for name, role in pairs[:3])
-            bullets.append(f"Named key personnel include {rendered}.")
-
-        if (
-            re.search(r"\bremoved\s+or\s+replaced\b[^.\n]{0,220}\bprior\s+written\s+consent\b", lowered)
-            or re.search(r"\bno\s+change\b[^.\n]{0,220}\bproject\s+manager\b[^.\n]{0,220}\bwritten\b", lowered)
-            or ("no change" in lowered and "project manager" in lowered)
-        ):
-            bullets.append(
-                "The Project Manager and other named key personnel cannot be changed or replaced without prior written consent/authorization."
-            )
-
-        return bullets
+        source_lines = "\n".join(f"[{item['index']}] {item['label']}" for item in sources)
+        tagged_answer = f"{cleaned}\n\nSources:\n{source_lines}"
+        return tagged_answer, sources
 
     @staticmethod
     def build_citations(source_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3655,36 +3387,765 @@ class MistralAnswerer:
 
         return sources
 
+
+################################################################################
+# FILE: src/pipeline/answerer_helpers.py
+################################################################################
+
+
+import re
+from typing import Any
+
+_NUMBER_WORDS: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+_STOPWORDS = {
+    "what",
+    "when",
+    "where",
+    "which",
+    "that",
+    "this",
+    "with",
+    "from",
+    "under",
+    "about",
+    "must",
+    "shall",
+    "would",
+    "could",
+    "should",
+}
+
+
+def render_context(chunks: list[dict[str, Any]], max_chars_per_chunk: int = 1500) -> str:
+    lines: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        metadata = dict(chunk.get("metadata", {}))
+        chunk_id = str(chunk.get("chunk_id", metadata.get("chunk_id", f"chunk_{index}")))
+        contract_name = str(metadata.get("contract_name", metadata.get("contract_id", "unknown_contract")))
+        clause_type = str(metadata.get("clause_type", "general"))
+        page_number = metadata.get("page_number")
+        section_heading = str(metadata.get("section_heading", ""))
+        text = str(chunk.get("text", "")).strip()
+
+        prefix = (
+            f"[{index}] chunk_id={chunk_id} contract={contract_name} "
+            f"clause={clause_type} page={page_number} heading={section_heading}"
+        )
+        lines.append(f"{prefix}\n{text[:max_chars_per_chunk]}")
+
+    return "\n\n".join(lines)
+
+
+def build_answer_prompt(question: str, source_chunks: list[dict[str, Any]]) -> str:
+    context = render_context(chunks=source_chunks[:12], max_chars_per_chunk=1200)
+    return (
+        "<s>[INST] You are an expert legal contract analysis assistant.\n"
+        "Answer the question using only the contract excerpts.\n"
+        "If not specified, respond exactly with: \"This information is not specified in the contract.\"\n"
+        "Keep the answer concise, factual, and cite support using [1], [2] style references.\n\n"
+        "[CONTRACT EXCERPTS]\n"
+        f"{context}\n\n"
+        "[QUESTION]\n"
+        f"{question.strip()}\n\n"
+        "Answer: [/INST]"
+    )
+
+
+def normalize_answer(answer: str) -> str:
+    cleaned = answer.strip()
+    cleaned = _remove_inconsistent_count_intro(cleaned)
+    return cleaned.strip()
+
+
+def _remove_inconsistent_count_intro(text: str) -> str:
+    numbered_count = len(re.findall(r"^\s*\d+\.\s", text, flags=re.MULTILINE))
+    if numbered_count < 2:
+        return text
+
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        match = re.search(
+            r"\bcontains\s+([A-Za-z]+|\d+)\s+(?:conditions?|grounds?|reasons?|ways?)\b",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+
+        raw_count = match.group(1).lower()
+        if raw_count.isdigit():
+            declared = int(raw_count)
+        else:
+            declared = _NUMBER_WORDS.get(raw_count, -1)
+
+        if declared > 0 and declared != numbered_count:
+            lines.pop(index)
+        break
+
+    return "\n".join(lines).strip()
+
+
+def build_extractive_fallback_answer(question: str, source_chunks: list[dict[str, Any]]) -> str:
+    if not source_chunks:
+        return "This contract does not contain a clause addressing that."
+
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9]{4,}", question.lower())
+        if token not in _STOPWORDS
+    }
+    if not query_terms:
+        query_terms = set(re.findall(r"[a-z0-9]{4,}", question.lower()))
+
+    ranked = _rank_candidate_sentences(source_chunks=source_chunks, query_terms=query_terms)
+
+    bullets: list[str] = []
+    seen: set[str] = set()
+    for _, sentence in ranked:
+        lowered = sentence.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        bullets.append(f"{len(bullets) + 1}. {sentence} [1]")
+        if len(bullets) >= 5:
+            break
+
+    if bullets:
+        return (
+            "Model generation is unavailable, so this answer is extracted from retrieved contract excerpts.\n"
+            + "\n".join(bullets)
+        )
+
+    fallback_text = str(source_chunks[0].get("text", "")).strip()
+    if fallback_text:
+        snippet = " ".join(fallback_text.split())[:260]
+        return f"Model generation is unavailable. Closest retrieved excerpt: {snippet} [1]"
+
+    return "This contract does not contain a clause addressing that."
+
+
+def _rank_candidate_sentences(
+    source_chunks: list[dict[str, Any]],
+    query_terms: set[str],
+) -> list[tuple[float, str]]:
+    ranked: list[tuple[float, str]] = []
+
+    for chunk in source_chunks[:12]:
+        metadata = dict(chunk.get("metadata", {}))
+        heading = str(metadata.get("section_heading", "")).lower()
+        text = str(chunk.get("text", "")).strip()
+        if not text:
+            continue
+
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+            cleaned = " ".join(sentence.split()).strip()
+            if len(cleaned) < 30:
+                continue
+            if cleaned[:1].islower():
+                continue
+            if cleaned.lower().startswith(("or ", "and ", "but ")):
+                continue
+
+            lowered_sentence = cleaned.lower()
+            sentence_terms = set(re.findall(r"[a-z0-9]{4,}", lowered_sentence))
+            overlap = len(query_terms & sentence_terms)
+            if overlap == 0:
+                continue
+
+            heading_overlap = sum(1 for term in query_terms if term in heading)
+            score = float(overlap) + (0.5 * float(heading_overlap))
+            ranked.append((score, cleaned))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+################################################################################
+# FILE: src/pipeline/artifact_store.py
+################################################################################
+
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from sqlalchemy import DateTime, String, Text, create_engine, delete, desc, select
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+    SQLALCHEMY_AVAILABLE = True
+except Exception:
+    SQLALCHEMY_AVAILABLE = False
+
+from src.utils.db import should_auto_create_tables
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+
+    raw_path = database_url[len(prefix):].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        return
+
+    try:
+        Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _now_utc_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_utc_naive(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    return parsed
+                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
+
+    return _now_utc_naive()
+
+
+if SQLALCHEMY_AVAILABLE:
+    class Base(DeclarativeBase):
+        pass
+
+
+    class StoredContractText(Base):
+        __tablename__ = "uploaded_contract_texts"
+
+        contract_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+        source_name: Mapped[str] = mapped_column(String(512), nullable=False)
+        raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+        raw_text_path: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
+        uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=_now_utc_naive, nullable=False)
+
+
+    class StoredContractChunk(Base):
+        __tablename__ = "stored_contract_chunks"
+
+        chunk_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+        contract_id: Mapped[str] = mapped_column(String(256), index=True, nullable=False)
+        text: Mapped[str] = mapped_column(Text, nullable=False)
+        metadata_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+        updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now_utc_naive, nullable=False)
+
+
+else:
+    class Base:  # type: ignore[no-redef]
+        pass
+
+
+    class StoredContractText:  # type: ignore[no-redef]
+        pass
+
+
+    class StoredContractChunk:  # type: ignore[no-redef]
+        pass
+
+
+class ContractArtifactStore:
+    def __init__(
+        self,
+        backend: str | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        self.database_url = str(database_url or os.getenv("DATABASE_URL", "")).strip()
+        resolved_backend = str(backend or os.getenv("ARTIFACT_STORE_BACKEND", "auto")).strip().lower()
+        self._db_enabled = False
+        self.engine = None
+        self.SessionLocal = None
+
+        if resolved_backend not in {"auto", "file", "db"}:
+            resolved_backend = "auto"
+
+        if resolved_backend != "file":
+            self._try_enable_db(strict=(resolved_backend == "db"))
+
+    @property
+    def db_enabled(self) -> bool:
+        return self._db_enabled
+
+    def _try_enable_db(self, strict: bool) -> None:
+        if not SQLALCHEMY_AVAILABLE:
+            if strict:
+                raise RuntimeError("SQLAlchemy is required for ARTIFACT_STORE_BACKEND=db.")
+            return
+
+        if not self.database_url:
+            if strict:
+                raise RuntimeError("DATABASE_URL is required for ARTIFACT_STORE_BACKEND=db.")
+            return
+
+        try:
+            _ensure_sqlite_parent_dir(self.database_url)
+            self.engine = create_engine(self.database_url, future=True)
+            self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+            if should_auto_create_tables(self.database_url):
+                Base.metadata.create_all(bind=self.engine)
+            self._db_enabled = True
+        except Exception as error:
+            self.engine = None
+            self.SessionLocal = None
+            self._db_enabled = False
+            if strict:
+                raise RuntimeError("Failed to initialize DB-backed ContractArtifactStore.") from error
+
+    def upsert_contract_text(
+        self,
+        contract_id: str,
+        source_name: str,
+        raw_text: str,
+        raw_text_path: str = "",
+        uploaded_at: str | datetime | None = None,
+    ) -> None:
+        if not self._db_enabled or self.SessionLocal is None:
+            return
+
+        with self.SessionLocal() as session:
+            existing = session.get(StoredContractText, contract_id)
+            timestamp = _as_utc_naive(uploaded_at)
+            if existing is None:
+                existing = StoredContractText(
+                    contract_id=contract_id,
+                    source_name=source_name,
+                    raw_text=str(raw_text),
+                    raw_text_path=str(raw_text_path),
+                    uploaded_at=timestamp,
+                )
+                session.add(existing)
+            else:
+                existing.source_name = source_name
+                existing.raw_text = str(raw_text)
+                existing.raw_text_path = str(raw_text_path)
+                existing.uploaded_at = timestamp
+
+            session.commit()
+
+    def get_contract_text(self, contract_id: str) -> dict[str, Any] | None:
+        if not self._db_enabled or self.SessionLocal is None:
+            return None
+
+        with self.SessionLocal() as session:
+            row = session.get(StoredContractText, contract_id)
+            if row is None:
+                return None
+
+            return {
+                "contract_id": row.contract_id,
+                "source_name": row.source_name,
+                "raw_text": row.raw_text,
+                "raw_text_path": row.raw_text_path,
+                "uploaded_at": row.uploaded_at.isoformat(),
+            }
+
+    def replace_contract_chunks(self, chunks: list[dict[str, Any]]) -> int:
+        if not self._db_enabled or self.SessionLocal is None:
+            return 0
+        if not chunks:
+            return 0
+
+        normalized: list[dict[str, Any]] = []
+        contract_ids: set[str] = set()
+
+        for chunk in chunks:
+            metadata = dict(chunk.get("metadata", {}))
+            chunk_id = str(chunk.get("chunk_id", "")).strip()
+            text = str(chunk.get("text", ""))
+            contract_id = str(metadata.get("contract_id", "")).strip()
+            if not chunk_id or not contract_id:
+                continue
+
+            metadata.setdefault("chunk_id", chunk_id)
+            metadata.setdefault("contract_id", contract_id)
+
+            normalized.append(
+                {
+                    "chunk_id": chunk_id,
+                    "contract_id": contract_id,
+                    "text": text,
+                    "metadata_json": json.dumps(metadata, ensure_ascii=True),
+                }
+            )
+            contract_ids.add(contract_id)
+
+        if not normalized:
+            return 0
+
+        with self.SessionLocal() as session:
+            for contract_id in contract_ids:
+                session.execute(
+                    delete(StoredContractChunk).where(StoredContractChunk.contract_id == contract_id)
+                )
+
+            for item in normalized:
+                session.add(
+                    StoredContractChunk(
+                        chunk_id=item["chunk_id"],
+                        contract_id=item["contract_id"],
+                        text=item["text"],
+                        metadata_json=item["metadata_json"],
+                        updated_at=_now_utc_naive(),
+                    )
+                )
+
+            session.commit()
+
+        return len(normalized)
+
+    def load_all_chunks(
+        self,
+        contract_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self._db_enabled or self.SessionLocal is None:
+            return []
+
+        with self.SessionLocal() as session:
+            stmt = select(StoredContractChunk)
+            if contract_ids:
+                normalized_contract_ids = [str(item).strip() for item in contract_ids if str(item).strip()]
+                if normalized_contract_ids:
+                    stmt = stmt.where(StoredContractChunk.contract_id.in_(normalized_contract_ids))
+            stmt = stmt.order_by(StoredContractChunk.updated_at.desc())
+            if limit is not None and limit > 0:
+                stmt = stmt.limit(limit)
+
+            rows = session.execute(stmt).scalars().all()
+            output: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    metadata = json.loads(row.metadata_json)
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except Exception:
+                    metadata = {}
+
+                metadata.setdefault("contract_id", row.contract_id)
+                metadata.setdefault("chunk_id", row.chunk_id)
+
+                output.append(
+                    {
+                        "chunk_id": row.chunk_id,
+                        "text": row.text,
+                        "metadata": metadata,
+                    }
+                )
+
+            return output
+
+    def chunk_count(self) -> int:
+        if not self._db_enabled or self.SessionLocal is None:
+            return 0
+
+        with self.SessionLocal() as session:
+            rows = session.execute(select(StoredContractChunk.chunk_id)).all()
+            return len(rows)
+
+    def chunk_revision(self) -> str:
+        if not self._db_enabled or self.SessionLocal is None:
+            return ""
+
+        with self.SessionLocal() as session:
+            row = session.execute(
+                select(StoredContractChunk.updated_at)
+                .order_by(desc(StoredContractChunk.updated_at))
+                .limit(1)
+            ).first()
+
+            if not row or not row[0]:
+                return ""
+            return row[0].isoformat()
+
+
+################################################################################
+# FILE: src/pipeline/chat_scope_registry.py
+################################################################################
+
+
+import json
+import os
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from filelock import FileLock
+except Exception:
+    FileLock = None
+
+try:
+    from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+    SQLALCHEMY_AVAILABLE = True
+except Exception:
+    SQLALCHEMY_AVAILABLE = False
+
+from src.utils.db import should_auto_create_tables
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+
+    raw_path = database_url[len(prefix):].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        return
+
+    try:
+        Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _now_utc_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+if SQLALCHEMY_AVAILABLE:
+    class Base(DeclarativeBase):
+        pass
+
+
+    class ChatScopeContract(Base):
+        __tablename__ = "chat_scope_contracts"
+        __table_args__ = (
+            UniqueConstraint("chat_id", "contract_id", name="uq_chat_scope_contract"),
+        )
+
+        id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+        chat_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+        contract_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+        created_at: Mapped[datetime] = mapped_column(DateTime, default=_now_utc_naive, nullable=False)
+
+
+else:
+    class Base:  # type: ignore[no-redef]
+        pass
+
+
+    class ChatScopeContract:  # type: ignore[no-redef]
+        pass
+
+
+class ChatScopeRegistry:
+    def __init__(
+        self,
+        registry_path: Path | str = Path("data/processed/chat_scope_registry.json"),
+        backend: str | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        self.registry_path = Path(registry_path)
+        self._lock = threading.RLock()
+        self._file_lock = FileLock(f"{self.registry_path}.lock") if FileLock is not None else None
+        self.database_url = str(database_url or os.getenv("DATABASE_URL", "")).strip()
+        resolved_backend = str(backend or os.getenv("REGISTRY_BACKEND", "auto")).strip().lower()
+        self._db_enabled = False
+        self.engine = None
+        self.SessionLocal = None
+
+        if resolved_backend not in {"auto", "file", "db"}:
+            resolved_backend = "auto"
+
+        if resolved_backend != "file":
+            self._try_enable_db(strict=(resolved_backend == "db"))
+
+    def _try_enable_db(self, strict: bool) -> None:
+        if not SQLALCHEMY_AVAILABLE:
+            if strict:
+                raise RuntimeError("SQLAlchemy is required for REGISTRY_BACKEND=db.")
+            return
+
+        if not self.database_url:
+            if strict:
+                raise RuntimeError("DATABASE_URL is required for REGISTRY_BACKEND=db.")
+            return
+
+        try:
+            _ensure_sqlite_parent_dir(self.database_url)
+            self.engine = create_engine(self.database_url, future=True)
+            self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+            if should_auto_create_tables(self.database_url):
+                Base.metadata.create_all(bind=self.engine)
+            self._db_enabled = True
+        except Exception as error:
+            self.engine = None
+            self.SessionLocal = None
+            self._db_enabled = False
+            if strict:
+                raise RuntimeError("Failed to initialize DB-backed ChatScopeRegistry.") from error
+
+    def add_contracts(self, chat_id: str, contract_ids: list[str]) -> None:
+        resolved_chat_id = self._normalize_chat_id(chat_id)
+        if not resolved_chat_id:
+            raise ValueError("chat_id is required.")
+
+        normalized_contract_ids = self._normalize_contract_ids(contract_ids)
+        if not normalized_contract_ids:
+            return
+
+        if self._db_enabled:
+            self._add_contracts_db(chat_id=resolved_chat_id, contract_ids=normalized_contract_ids)
+            return
+
+        with self._locked():
+            payload = self._read_payload()
+            existing = self._normalize_contract_ids(payload.get(resolved_chat_id, []))
+            merged = self._normalize_contract_ids(existing + normalized_contract_ids)
+            payload[resolved_chat_id] = merged
+            self._write_payload(payload)
+
+    def list_contract_ids(self, chat_id: str) -> list[str]:
+        resolved_chat_id = self._normalize_chat_id(chat_id)
+        if not resolved_chat_id:
+            return []
+
+        if self._db_enabled:
+            return self._list_contract_ids_db(chat_id=resolved_chat_id)
+
+        with self._locked():
+            payload = self._read_payload()
+            return self._normalize_contract_ids(payload.get(resolved_chat_id, []))
+
+    def _add_contracts_db(self, chat_id: str, contract_ids: list[str]) -> None:
+        if self.SessionLocal is None:
+            return
+
+        with self.SessionLocal() as session:
+            existing_rows = session.execute(
+                select(ChatScopeContract.contract_id).where(ChatScopeContract.chat_id == chat_id)
+            ).all()
+            existing = {str(row[0]).strip() for row in existing_rows if str(row[0]).strip()}
+
+            for contract_id in contract_ids:
+                if contract_id in existing:
+                    continue
+                session.add(
+                    ChatScopeContract(
+                        chat_id=chat_id,
+                        contract_id=contract_id,
+                        created_at=_now_utc_naive(),
+                    )
+                )
+
+            try:
+                session.commit()
+            except IntegrityError:
+                # Another process may have inserted the same chat/contract mapping.
+                session.rollback()
+
+    def _list_contract_ids_db(self, chat_id: str) -> list[str]:
+        if self.SessionLocal is None:
+            return []
+
+        with self.SessionLocal() as session:
+            rows = session.execute(
+                select(ChatScopeContract.contract_id)
+                .where(ChatScopeContract.chat_id == chat_id)
+                .order_by(ChatScopeContract.id.asc())
+            ).all()
+            return self._normalize_contract_ids([str(row[0]) for row in rows if row and row[0]])
+
+    @contextmanager
+    def _locked(self):
+        with self._lock:
+            if self._file_lock is None:
+                yield
+            else:
+                with self._file_lock:
+                    yield
+
     @staticmethod
-    def _append_subcontracting_clarification(
-        text: str,
-        question: str,
-        source_chunks: list[dict[str, Any]],
-    ) -> str:
-        lowered_question = question.lower()
-        if "subcontract" not in lowered_question:
-            return text
+    def _normalize_chat_id(chat_id: str | None) -> str:
+        return str(chat_id or "").strip()
 
-        evidence_blob = MistralAnswerer._compose_evidence_blob(source_chunks)
-        lowered_evidence = evidence_blob.lower()
-        additions: list[str] = []
+    @staticmethod
+    def _normalize_contract_ids(contract_ids: list[str] | tuple[str, ...] | None) -> list[str]:
+        if not contract_ids:
+            return []
 
-        if re.search(r"prior\s+written\s+authorization", lowered_evidence) and "fee schedule" in lowered_evidence:
-            if "written authorization" not in text.lower():
-                additions.append("Prior written authorization from the Contract Manager is required before subcontracting any work not already in the approved Fee Schedule.")
-                
-        if not additions:
-            return text
+        output: list[str] = []
+        seen: set[str] = set()
+        for contract_id in contract_ids:
+            normalized = str(contract_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            output.append(normalized)
 
-        bullet_block = "\n".join(f"- {item}" for item in additions)
-        return f"{text.rstrip()}\n\n{bullet_block}"
+        return output
+
+    def _read_payload(self) -> dict[str, list[str]]:
+        if not self.registry_path.exists():
+            return {}
+
+        try:
+            payload: Any = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return {}
+
+            output: dict[str, list[str]] = {}
+            for key, value in payload.items():
+                chat_id = self._normalize_chat_id(str(key))
+                if not chat_id:
+                    continue
+                if not isinstance(value, list):
+                    continue
+                output[chat_id] = self._normalize_contract_ids(value)
+
+            return output
+        except Exception:
+            return {}
+
+    def _write_payload(self, payload: dict[str, list[str]]) -> None:
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.registry_path.with_suffix(f"{self.registry_path.suffix}.tmp")
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(self.registry_path)
 
 
 ################################################################################
 # FILE: src/pipeline/chunker.py
 ################################################################################
 
-from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -4017,8 +4478,22 @@ def extract_clause_hints_from_question(question: str) -> list[str]:
     lowered = question.lower()
     boosted_hints: list[str] = []
 
-    if re.search(r"\bterminat(?:e|es|ed|ing|ion)?\b", lowered):
-        boosted_hints.extend(["termination_for_convenience", "termination_for_cause"])
+    has_termination = bool(re.search(r"\bterminat(?:e|es|ed|ing|ion)?\b", lowered))
+    asks_convenience = bool(
+        re.search(r"\b(convenience|without cause|at any time)\b", lowered)
+    )
+    asks_cause = bool(
+        re.search(r"\b(for cause|material breach|default|cure)\b", lowered)
+    )
+
+    if has_termination:
+        if asks_convenience:
+            boosted_hints.append("termination_for_convenience")
+        if asks_cause:
+            boosted_hints.append("termination_for_cause")
+        if not asks_convenience and not asks_cause:
+            boosted_hints.extend(["termination_for_convenience", "termination_for_cause"])
+
     if re.search(r"\brenew(?:al|als|ed|ing)?\b", lowered):
         boosted_hints.extend(["renewal_term", "notice_to_terminate_renewal"])
 
@@ -4056,13 +4531,91 @@ def extract_clause_hints_from_question(question: str) -> list[str]:
 # FILE: src/pipeline/contracts_registry.py
 ################################################################################
 
-from __future__ import annotations
 
 import json
+import os
 import re
-from datetime import datetime
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from filelock import FileLock
+except Exception:
+    FileLock = None
+
+try:
+    from sqlalchemy import DateTime, Integer, String, create_engine, desc, select
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+    SQLALCHEMY_AVAILABLE = True
+except Exception:
+    SQLALCHEMY_AVAILABLE = False
+
+from src.utils.db import should_auto_create_tables
+
+
+def _ensure_sqlite_parent_dir(database_url: str) -> None:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        return
+
+    raw_path = database_url[len(prefix):].split("?", 1)[0]
+    if not raw_path or raw_path == ":memory:":
+        return
+
+    try:
+        Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _as_utc_naive(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    return parsed
+                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+if SQLALCHEMY_AVAILABLE:
+    class Base(DeclarativeBase):
+        pass
+
+
+    class ContractRecord(Base):
+        __tablename__ = "contracts_registry"
+
+        contract_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+        display_name: Mapped[str] = mapped_column(String(512), nullable=False)
+        source_name: Mapped[str] = mapped_column(String(512), nullable=False)
+        chunks_ingested: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+        uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), nullable=False)
+
+
+else:
+    class Base:  # type: ignore[no-redef]
+        pass
+
+
+    class ContractRecord:  # type: ignore[no-redef]
+        pass
 
 
 class ContractRegistry:
@@ -4071,16 +4624,62 @@ class ContractRegistry:
         registry_path: Path | str = Path("data/processed/contracts_registry.json"),
         raw_upload_dir: Path | str = Path("data/raw/uploads"),
         chunk_metadata_path: Path | str = Path("data/processed/chunk_metadata.json"),
+        backend: str | None = None,
+        database_url: str | None = None,
     ) -> None:
         self.registry_path = Path(registry_path)
         self.raw_upload_dir = Path(raw_upload_dir)
         self.chunk_metadata_path = Path(chunk_metadata_path)
+        self._lock = threading.RLock()
+        self._file_lock = FileLock(f"{self.registry_path}.lock") if FileLock is not None else None
+        self.database_url = str(database_url or os.getenv("DATABASE_URL", "")).strip()
+        resolved_backend = str(backend or os.getenv("REGISTRY_BACKEND", "auto")).strip().lower()
+        self._db_enabled = False
+        self.engine = None
+        self.SessionLocal = None
+
+        if resolved_backend not in {"auto", "file", "db"}:
+            resolved_backend = "auto"
+
+        if resolved_backend != "file":
+            self._try_enable_db(strict=(resolved_backend == "db"))
+
+    def _try_enable_db(self, strict: bool) -> None:
+        if not SQLALCHEMY_AVAILABLE:
+            if strict:
+                raise RuntimeError("SQLAlchemy is required for REGISTRY_BACKEND=db.")
+            return
+
+        if not self.database_url:
+            if strict:
+                raise RuntimeError("DATABASE_URL is required for REGISTRY_BACKEND=db.")
+            return
+
+        try:
+            _ensure_sqlite_parent_dir(self.database_url)
+            self.engine = create_engine(self.database_url, future=True)
+            self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+            if should_auto_create_tables(self.database_url):
+                Base.metadata.create_all(bind=self.engine)
+            self._db_enabled = True
+        except Exception as error:
+            self.engine = None
+            self.SessionLocal = None
+            self._db_enabled = False
+            if strict:
+                raise RuntimeError("Failed to initialize DB-backed ContractRegistry.") from error
 
     def list_contracts(self) -> list[dict[str, Any]]:
-        rows = self._read_rows()
-        rows = self._merge_with_existing_uploads(rows)
-        rows.sort(key=lambda row: str(row.get("uploaded_at", "")), reverse=True)
-        return rows
+        if self._db_enabled:
+            return self._list_contracts_db()
+
+        with self._locked():
+            rows = self._read_rows()
+            merged_rows = self._merge_with_existing_uploads(rows)
+            if merged_rows != rows:
+                self._write_rows(merged_rows)
+            merged_rows.sort(key=lambda row: str(row.get("uploaded_at", "")), reverse=True)
+            return merged_rows
 
     def upsert(
         self,
@@ -4089,30 +4688,108 @@ class ContractRegistry:
         chunks_ingested: int,
         uploaded_at: str | None = None,
     ) -> dict[str, Any]:
-        rows = self._read_rows()
-        now_iso = uploaded_at or datetime.utcnow().isoformat()
+        if self._db_enabled:
+            return self._upsert_db(
+                contract_id=contract_id,
+                source_name=source_name,
+                chunks_ingested=chunks_ingested,
+                uploaded_at=uploaded_at,
+            )
 
-        record = {
-            "contract_id": contract_id,
-            "display_name": _to_display_name(source_name=source_name, contract_id=contract_id),
-            "source_name": source_name,
-            "chunks_ingested": int(chunks_ingested),
-            "uploaded_at": now_iso,
-        }
+        with self._locked():
+            rows = self._read_rows()
+            now_iso = uploaded_at or datetime.utcnow().isoformat()
 
-        updated = False
-        for index, row in enumerate(rows):
-            if str(row.get("contract_id", "")) == contract_id:
-                rows[index] = record
-                updated = True
-                break
+            record = {
+                "contract_id": contract_id,
+                "display_name": _to_display_name(source_name=source_name, contract_id=contract_id),
+                "source_name": source_name,
+                "chunks_ingested": int(chunks_ingested),
+                "uploaded_at": now_iso,
+            }
 
-        if not updated:
-            rows.append(record)
+            updated = False
+            for index, row in enumerate(rows):
+                if str(row.get("contract_id", "")) == contract_id:
+                    rows[index] = record
+                    updated = True
+                    break
 
-        rows = self._merge_with_existing_uploads(rows)
-        self._write_rows(rows)
-        return record
+            if not updated:
+                rows.append(record)
+
+            rows = self._merge_with_existing_uploads(rows)
+            self._write_rows(rows)
+            return record
+
+    def _upsert_db(
+        self,
+        contract_id: str,
+        source_name: str,
+        chunks_ingested: int,
+        uploaded_at: str | None = None,
+    ) -> dict[str, Any]:
+        if self.SessionLocal is None:
+            raise RuntimeError("DB session is not initialized for ContractRegistry.")
+
+        resolved_uploaded_at = _as_utc_naive(uploaded_at)
+        display_name = _to_display_name(source_name=source_name, contract_id=contract_id)
+
+        with self.SessionLocal() as session:
+            existing = session.get(ContractRecord, contract_id)
+            if existing is None:
+                existing = ContractRecord(
+                    contract_id=contract_id,
+                    display_name=display_name,
+                    source_name=source_name,
+                    chunks_ingested=int(chunks_ingested),
+                    uploaded_at=resolved_uploaded_at,
+                )
+                session.add(existing)
+            else:
+                existing.display_name = display_name
+                existing.source_name = source_name
+                existing.chunks_ingested = int(chunks_ingested)
+                existing.uploaded_at = resolved_uploaded_at
+
+            session.commit()
+
+            return {
+                "contract_id": existing.contract_id,
+                "display_name": existing.display_name,
+                "source_name": existing.source_name,
+                "chunks_ingested": int(existing.chunks_ingested),
+                "uploaded_at": existing.uploaded_at.isoformat(),
+            }
+
+    def _list_contracts_db(self) -> list[dict[str, Any]]:
+        if self.SessionLocal is None:
+            return []
+
+        with self.SessionLocal() as session:
+            rows = session.execute(
+                select(ContractRecord).order_by(desc(ContractRecord.uploaded_at))
+            ).scalars().all()
+
+            return [
+                {
+                    "contract_id": row.contract_id,
+                    "display_name": row.display_name,
+                    "source_name": row.source_name,
+                    "chunks_ingested": int(row.chunks_ingested),
+                    "uploaded_at": row.uploaded_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    @contextmanager
+    def _locked(self):
+        with self._lock:
+            if self._file_lock is None:
+                yield
+            else:
+                with self._file_lock:
+                    yield
 
     def _read_rows(self) -> list[dict[str, Any]]:
         if not self.registry_path.exists():
@@ -4132,7 +4809,9 @@ class ContractRegistry:
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        self.registry_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        temp_path = self.registry_path.with_suffix(f"{self.registry_path.suffix}.tmp")
+        temp_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        temp_path.replace(self.registry_path)
 
     def _merge_with_existing_uploads(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         discovered_by_id: dict[str, dict[str, Any]] = {}
@@ -4161,9 +4840,7 @@ class ContractRegistry:
             if contract_id not in merged_by_id:
                 merged_by_id[contract_id] = discovered
 
-        merged = list(merged_by_id.values())
-        self._write_rows(merged)
-        return merged
+        return list(merged_by_id.values())
 
     def _discover_existing_uploads(self) -> list[dict[str, Any]]:
         if not self.raw_upload_dir.exists():
@@ -4204,12 +4881,29 @@ class ContractRegistry:
             return {}
 
         counts: dict[str, int] = {}
+        seen_chunk_ids: set[str] = set()
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            contract_id = str(item.get("contract_id") or item.get("contract_name") or "").strip()
+
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            contract_id = str(
+                item.get("contract_id")
+                or item.get("contract_name")
+                or metadata.get("contract_id")
+                or metadata.get("contract_name")
+                or ""
+            ).strip()
             if not contract_id:
                 continue
+
+            chunk_id = str(item.get("chunk_id") or metadata.get("chunk_id") or "").strip()
+            if chunk_id:
+                dedupe_key = f"{contract_id}:{chunk_id}"
+                if dedupe_key in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(dedupe_key)
+
             counts[contract_id] = counts.get(contract_id, 0) + 1
 
         return counts
@@ -4230,8 +4924,15 @@ class ContractRegistry:
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            contract_id = str(item.get("contract_id") or item.get("contract_name") or "").strip()
-            source_name = str(item.get("source_name", "")).strip()
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            contract_id = str(
+                item.get("contract_id")
+                or item.get("contract_name")
+                or metadata.get("contract_id")
+                or metadata.get("contract_name")
+                or ""
+            ).strip()
+            source_name = str(item.get("source_name") or metadata.get("source_name") or "").strip()
             if contract_id and source_name and contract_id not in output:
                 output[contract_id] = source_name
 
@@ -4265,9 +4966,11 @@ def _to_display_name(source_name: str, contract_id: str) -> str:
 # FILE: src/pipeline/embedder.py
 ################################################################################
 
-from __future__ import annotations
 
 import hashlib
+import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -4280,9 +4983,12 @@ except Exception:
         pass
 
 try:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_huggingface import HuggingFaceEmbeddings
 except Exception:
-    HuggingFaceEmbeddings = None
+    try:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+    except Exception:
+        HuggingFaceEmbeddings = None
 
 try:
     from langchain_chroma import Chroma
@@ -4294,15 +5000,31 @@ except Exception:
 
 
 from src.utils.embeddings import HashEmbeddings, get_hash_embeddings
+from src.pipeline.artifact_store import ContractArtifactStore
+
+
+_EMBEDDING_CACHE: dict[str, Embeddings] = {}
+_EMBEDDING_CACHE_LOCK = threading.RLock()
 
 def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
-    if HuggingFaceEmbeddings is not None:
-        try:
-            return HuggingFaceEmbeddings(model_name=model_name)
-        except Exception:
-            pass
+    normalized_model_name = str(model_name or "sentence-transformers/all-MiniLM-L6-v2").strip()
 
-    return get_hash_embeddings()
+    with _EMBEDDING_CACHE_LOCK:
+        cached = _EMBEDDING_CACHE.get(normalized_model_name)
+        if cached is not None:
+            return cached
+
+        resolved: Embeddings
+        if HuggingFaceEmbeddings is not None:
+            try:
+                resolved = HuggingFaceEmbeddings(model_name=normalized_model_name)
+            except Exception:
+                resolved = get_hash_embeddings()
+        else:
+            resolved = get_hash_embeddings()
+
+        _EMBEDDING_CACHE[normalized_model_name] = resolved
+        return resolved
 
 
 class ContractVectorStore:
@@ -4311,11 +5033,20 @@ class ContractVectorStore:
         persist_directory: Path | str = Path("data/processed/chroma"),
         collection_name: str = "contracts",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        artifact_store: ContractArtifactStore | None = None,
     ) -> None:
         self.persist_directory = Path(persist_directory)
         self.collection_name = collection_name
         self.embeddings = resolve_embeddings(model_name=embedding_model)
+        self.artifact_store = artifact_store
         self._store: Any | None = None
+        self.sync_interval_seconds = max(
+            0.0,
+            float(os.getenv("VECTOR_ARTIFACT_SYNC_INTERVAL_SECONDS", "30")),
+        )
+        self._last_sync_check = 0.0
+        self._last_synced_revision = ""
+        self._sync_lock = threading.RLock()
 
     def get_store(self) -> Any:
         if Chroma is None:
@@ -4328,6 +5059,8 @@ class ContractVectorStore:
                 embedding_function=self.embeddings,
                 persist_directory=str(self.persist_directory),
             )
+
+        self._sync_from_artifact_store_if_needed(store=self._store)
         return self._store
 
     def index_chunks(self, chunks: list[dict[str, Any]]) -> int:
@@ -4342,11 +5075,7 @@ class ContractVectorStore:
         }
 
         for contract_id in contract_ids:
-            try:
-                store.delete(where={"contract_id": contract_id})
-            except Exception:
-                # Some vector store adapters raise when no records match.
-                pass
+            self._delete_contract_chunks(store=store, contract_id=contract_id)
 
         ids = [str(chunk.get("chunk_id")) for chunk in chunks]
         texts = [str(chunk.get("text", "")) for chunk in chunks]
@@ -4362,17 +5091,125 @@ class ContractVectorStore:
         except Exception:
             # Newer Chroma clients persist automatically.
             pass
+
+        if self.artifact_store is not None:
+            self.artifact_store.replace_contract_chunks(chunks)
+            self._last_synced_revision = self.artifact_store.chunk_revision()
+            self._last_sync_check = time.monotonic()
+
         return len(chunks)
+
+    def _sync_from_artifact_store_if_needed(self, store: Any) -> None:
+        with self._sync_lock:
+            if self.artifact_store is None or not self.artifact_store.db_enabled:
+                return
+
+            now = time.monotonic()
+            if self.sync_interval_seconds > 0 and (now - self._last_sync_check) < self.sync_interval_seconds:
+                return
+            self._last_sync_check = now
+
+            remote_count = self.artifact_store.chunk_count()
+            if remote_count <= 0:
+                return
+
+            remote_revision = self.artifact_store.chunk_revision()
+            local_count = self._store_count(store)
+            if local_count == remote_count and remote_revision and remote_revision == self._last_synced_revision:
+                return
+
+            chunks = self.artifact_store.load_all_chunks()
+            if not chunks:
+                return
+
+            self._replace_store_chunks(store=store, chunks=chunks)
+            self._last_synced_revision = remote_revision
+
+    def _replace_store_chunks(self, store: Any, chunks: list[dict[str, Any]]) -> None:
+        ids = [str(chunk.get("chunk_id")) for chunk in chunks if str(chunk.get("chunk_id", "")).strip()]
+        texts = [str(chunk.get("text", "")) for chunk in chunks if str(chunk.get("chunk_id", "")).strip()]
+        metadatas = []
+        for chunk in chunks:
+            if not str(chunk.get("chunk_id", "")).strip():
+                continue
+            metadata = dict(chunk.get("metadata", {}))
+            metadata.setdefault("chunk_id", str(chunk.get("chunk_id", "")))
+            metadatas.append(metadata)
+
+        if not ids:
+            return
+
+        self._clear_store(store=store)
+        store.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+        try:
+            store.persist()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _clear_store(store: Any) -> None:
+        ids: list[str] = []
+        try:
+            payload = store.get(include=[])
+            raw_ids = payload.get("ids", []) if isinstance(payload, dict) else []
+            if raw_ids and isinstance(raw_ids[0], list):
+                for group in raw_ids:
+                    ids.extend(str(item) for item in group)
+            else:
+                ids = [str(item) for item in raw_ids]
+        except Exception:
+            ids = []
+
+        if ids:
+            try:
+                store.delete(ids=ids)
+                return
+            except Exception:
+                pass
+
+        try:
+            store.delete(where={})
+        except Exception:
+            pass
+
+    @staticmethod
+    def _store_count(store: Any) -> int:
+        try:
+            collection = getattr(store, "_collection", None)
+            if collection is not None and hasattr(collection, "count"):
+                return int(collection.count())
+        except Exception:
+            pass
+
+        try:
+            payload = store.get(include=[])
+            ids = payload.get("ids", []) if isinstance(payload, dict) else []
+            return len(ids)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _delete_contract_chunks(store: Any, contract_id: str) -> None:
+        attempts = [
+            {"where": {"contract_id": {"$eq": contract_id}}},
+            {"where": {"contract_id": contract_id}},
+        ]
+
+        for kwargs in attempts:
+            try:
+                store.delete(**kwargs)
+                return
+            except Exception:
+                continue
 
 
 ################################################################################
 # FILE: src/pipeline/parser.py
 ################################################################################
 
-from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -4385,6 +5222,9 @@ try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
+
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 @dataclass
@@ -4410,7 +5250,10 @@ class DocumentParser:
         if not file_bytes:
             raise ValueError("Uploaded file is empty.")
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            raise ValueError("File exceeds 10MB maximum size limit.")
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         resolved_contract_id = contract_id or _safe_contract_id(filename=filename, timestamp=timestamp)
 
         suffix = Path(filename).suffix.lower()
@@ -4435,37 +5278,49 @@ class DocumentParser:
 
     @staticmethod
     def _extract_pdf_text(file_bytes: bytes) -> str:
+        errors: list[str] = []
+
         if fitz is not None:
             try:
                 document = fitz.open(stream=file_bytes, filetype="pdf")
                 pages = [page.get_text("text") for page in document]
                 document.close()
-                return "\n".join(pages)
-            except Exception:
-                pass
+                text = "\n".join(pages).strip()
+                if text:
+                    return text
+                errors.append("pymupdf extracted empty text")
+            except Exception as error:
+                errors.append(f"pymupdf: {error}")
 
         if PdfReader is not None:
             try:
                 reader = PdfReader(BytesIO(file_bytes))
                 pages = [page.extract_text() or "" for page in reader.pages]
-                return "\n".join(pages)
-            except Exception:
-                pass
+                text = "\n".join(pages).strip()
+                if text:
+                    return text
+                errors.append("pypdf extracted empty text")
+            except Exception as error:
+                errors.append(f"pypdf: {error}")
 
-        raise ValueError("PDF parsing failed. Install pymupdf (preferred) or ensure pypdf is available.")
+        details = "; ".join(errors) if errors else "no parser backend succeeded"
+        raise ValueError(
+            "PDF parsing failed. Install pymupdf (preferred) or ensure pypdf is available. "
+            f"Details: {details}"
+        )
 
 
 ################################################################################
 # FILE: src/pipeline/pipeline.py
 ################################################################################
 
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from src.evaluation.ragas_evaluator import RagasEvaluator
+from src.evaluation.ragas_evaluator import ContractQAEvaluator
 from src.pipeline.answerer import MistralAnswerer
+from src.pipeline.artifact_store import ContractArtifactStore
 from src.pipeline.chunker import ClauseAwareChunker, extract_clause_hints_from_question
 from src.pipeline.contracts_registry import ContractRegistry
 from src.pipeline.embedder import ContractVectorStore
@@ -4481,18 +5336,26 @@ class ContractQAPipeline:
         vector_store: ContractVectorStore | None = None,
         retriever: ClauseAwareRetriever | None = None,
         answerer: MistralAnswerer | None = None,
-        evaluator: RagasEvaluator | None = None,
+        evaluator: ContractQAEvaluator | None = None,
         registry: ContractRegistry | None = None,
+        artifact_store: ContractArtifactStore | None = None,
     ) -> None:
+        self.artifact_store = artifact_store or ContractArtifactStore()
         self.parser = parser or DocumentParser(raw_upload_dir=Path("data/raw/uploads"))
         self.chunker = chunker or ClauseAwareChunker()
         self.vector_store = vector_store or ContractVectorStore(
             persist_directory=Path("data/processed/chroma"),
             collection_name="contracts",
+            artifact_store=self.artifact_store,
         )
+        if getattr(self.vector_store, "artifact_store", None) is None:
+            try:
+                self.vector_store.artifact_store = self.artifact_store
+            except Exception:
+                pass
         self.retriever = retriever or ClauseAwareRetriever(vector_store=self.vector_store)
         self.answerer = answerer or MistralAnswerer()
-        self.evaluator = evaluator or RagasEvaluator(use_ragas=True)
+        self.evaluator = evaluator or ContractQAEvaluator(use_llm_judge=True)
         self.registry = registry or ContractRegistry()
 
     def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None) -> dict[str, Any]:
@@ -4500,6 +5363,13 @@ class ContractQAPipeline:
             filename=filename,
             file_bytes=file_bytes,
             contract_id=contract_id,
+        )
+
+        self.artifact_store.upsert_contract_text(
+            contract_id=parsed.contract_id,
+            source_name=parsed.source_name,
+            raw_text=parsed.text,
+            raw_text_path=str(parsed.raw_text_path),
         )
 
         chunks = self.chunker.chunk_contract(contract_id=parsed.contract_id, text=parsed.text)
@@ -4512,6 +5382,7 @@ class ContractQAPipeline:
             metadata.setdefault("contract_name", parsed.contract_id)
             metadata["source_name"] = parsed.source_name
             metadata["raw_text_path"] = str(parsed.raw_text_path)
+            metadata["raw_text_ref"] = f"db://uploaded_contract_texts/{parsed.contract_id}"
             chunk["metadata"] = metadata
 
         ingested = self.vector_store.index_chunks(chunks)
@@ -4535,6 +5406,7 @@ class ContractQAPipeline:
         question: str,
         contract_id: str | None = None,
         ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         clause_hints = extract_clause_hints_from_question(question)
         retrieval_k = 8
@@ -4561,6 +5433,7 @@ class ContractQAPipeline:
             contract_id=contract_id,
             k=retrieval_k,
             clause_hints=clause_hints,
+            allowed_contract_ids=allowed_contract_ids,
         )
         model_answer = self.answerer.answer(question=question, source_chunks=source_chunks)
         answer, sources = self.answerer.finalize_answer_with_sources(
@@ -4583,7 +5456,10 @@ class ContractQAPipeline:
             else:
                 route_reason = "Retrieved top contract chunks from vector search."
         else:
-            route_reason = "No relevant chunks were found in the indexed contract store."
+            if allowed_contract_ids is not None:
+                route_reason = "No relevant chunks were found in contracts available to this chat."
+            else:
+                route_reason = "No relevant chunks were found in the indexed contract store."
 
         return {
             "answer": answer,
@@ -4602,11 +5478,15 @@ class ContractQAPipeline:
 # FILE: src/pipeline/retriever.py
 ################################################################################
 
-from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
+
+try:
+    from rank_bm25 import BM25Okapi
+except Exception:
+    BM25Okapi = None
 
 from src.pipeline.chunker import CUAD_CLAUSE_HINTS, extract_clause_hints_from_question
 from src.pipeline.embedder import ContractVectorStore
@@ -4631,11 +5511,15 @@ class ClauseAwareRetriever:
         default_k: int = 5,
         candidate_k: int = 48,
         clause_boost: float = 0.18,
+        enable_sparse_rerank: bool = True,
+        sparse_rerank_weight: float = 0.2,
     ) -> None:
         self.vector_store = vector_store
         self.default_k = default_k
         self.candidate_k = candidate_k
         self.clause_boost = clause_boost
+        self.enable_sparse_rerank = enable_sparse_rerank
+        self.sparse_rerank_weight = sparse_rerank_weight
 
     def get_top_k(
         self,
@@ -4643,16 +5527,41 @@ class ClauseAwareRetriever:
         contract_id: str | None = None,
         k: int | None = None,
         clause_hints: list[str] | None = None,
+        allowed_contract_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         resolved_k = max(1, int(k or self.default_k))
         hints = clause_hints or extract_clause_hints_from_question(query)
+        if allowed_contract_ids is None:
+            normalized_allowed_contract_ids: list[str] = []
+        else:
+            normalized_allowed_contract_ids = _normalize_contract_ids(allowed_contract_ids)
+            if not normalized_allowed_contract_ids:
+                return []
+
+        allowed_set = set(normalized_allowed_contract_ids)
+
+        if contract_id and allowed_set and contract_id not in allowed_set:
+            return []
+
         where_filter = {"contract_id": contract_id} if contract_id else None
 
         search_k = max(resolved_k, self.candidate_k)
-        raw_results = list(self._similarity_search(query=query, k=search_k, where=where_filter))
+        raw_results = self._scoped_similarity_search(
+            query=query,
+            k=search_k,
+            where=where_filter,
+            allowed_contract_ids=normalized_allowed_contract_ids,
+        )
 
         for expanded_query in _build_expanded_queries(query=query, hints=hints):
-            raw_results.extend(self._similarity_search(query=expanded_query, k=max(resolved_k * 2, 12), where=where_filter))
+            raw_results.extend(
+                self._scoped_similarity_search(
+                    query=expanded_query,
+                    k=max(resolved_k * 2, 12),
+                    where=where_filter,
+                    allowed_contract_ids=normalized_allowed_contract_ids,
+                )
+            )
 
         reranked_by_chunk_id: dict[str, RetrievedChunk] = {}
         for index, (document, raw_score) in enumerate(raw_results, start=1):
@@ -4695,6 +5604,20 @@ class ClauseAwareRetriever:
 
         reranked = list(reranked_by_chunk_id.values())
 
+        if allowed_set:
+            reranked = [
+                item
+                for item in reranked
+                if str(item.metadata.get("contract_id", item.metadata.get("contract_name", ""))).strip() in allowed_set
+            ]
+
+        if self.enable_sparse_rerank:
+            reranked = _apply_sparse_rerank(
+                reranked,
+                query=query,
+                weight=self.sparse_rerank_weight,
+            )
+
         reranked.sort(key=lambda item: item.rerank_score, reverse=True)
 
         if _is_invoice_question(query):
@@ -4708,6 +5631,32 @@ class ClauseAwareRetriever:
 
         return [asdict(item) for item in reranked[:resolved_k]]
 
+    def _scoped_similarity_search(
+        self,
+        query: str,
+        k: int,
+        where: dict[str, Any] | None,
+        allowed_contract_ids: list[str] | None,
+    ) -> list[tuple[Any, float | None]]:
+        if where:
+            return list(self._similarity_search(query=query, k=k, where=where))
+
+        if not allowed_contract_ids:
+            return list(self._similarity_search(query=query, k=k, where=None))
+
+        per_contract_k = max(4, min(k, (k // max(1, len(allowed_contract_ids))) + 2))
+        scoped_results: list[tuple[Any, float | None]] = []
+        for contract_id in allowed_contract_ids:
+            scoped_results.extend(
+                self._similarity_search(
+                    query=query,
+                    k=per_contract_k,
+                    where={"contract_id": contract_id},
+                )
+            )
+
+        return scoped_results
+
     def _similarity_search(
         self,
         query: str,
@@ -4716,30 +5665,45 @@ class ClauseAwareRetriever:
     ) -> list[tuple[Any, float | None]]:
         store = self.vector_store.get_store()
 
+        if where:
+            filter_variants: list[dict[str, Any] | None] = [
+                where,
+                {key: {"$eq": value} for key, value in where.items()},
+            ]
+        else:
+            filter_variants = [None]
+
         if hasattr(store, "similarity_search_with_score"):
-            try:
-                kwargs = {"query": query, "k": k}
-                if where:
-                    kwargs["filter"] = where
-                return list(store.similarity_search_with_score(**kwargs))
-            except Exception:
-                pass
+            for filter_variant in filter_variants:
+                try:
+                    kwargs = {"query": query, "k": k}
+                    if filter_variant is not None:
+                        kwargs["filter"] = filter_variant
+                    return list(store.similarity_search_with_score(**kwargs))
+                except Exception:
+                    continue
 
         if hasattr(store, "similarity_search_with_relevance_scores"):
+            for filter_variant in filter_variants:
+                try:
+                    kwargs = {"query": query, "k": k}
+                    if filter_variant is not None:
+                        kwargs["filter"] = filter_variant
+                    return list(store.similarity_search_with_relevance_scores(**kwargs))
+                except Exception:
+                    continue
+
+        for filter_variant in filter_variants:
             try:
                 kwargs = {"query": query, "k": k}
-                if where:
-                    kwargs["filter"] = where
-                return list(store.similarity_search_with_relevance_scores(**kwargs))
+                if filter_variant is not None:
+                    kwargs["filter"] = filter_variant
+                documents = list(store.similarity_search(**kwargs))
+                return [(document, None) for document in documents]
             except Exception:
-                pass
+                continue
 
-        kwargs = {"query": query, "k": k}
-        if where:
-            kwargs["filter"] = where
-
-        documents = list(store.similarity_search(**kwargs))
-        return [(document, None) for document in documents]
+        return []
 
 
 def _normalize_similarity(raw_score: float | None) -> float:
@@ -4761,6 +5725,22 @@ def _normalize_similarity(raw_score: float | None) -> float:
         return 1.0 / (1.0 + value)
 
     return 0.0
+
+
+def _normalize_contract_ids(contract_ids: list[str] | None) -> list[str]:
+    if not contract_ids:
+        return []
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for contract_id in contract_ids:
+        normalized = str(contract_id or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+
+    return output
 
 
 def _prioritize_for_clause_hints(results: list[RetrievedChunk], hints: list[str]) -> list[RetrievedChunk]:
@@ -4974,6 +5954,55 @@ def _is_invoice_question(query: str) -> bool:
     return any(term in lowered for term in ("invoice", "billing", "payment deadline", "submit invoice"))
 
 
+def _tokenize_for_sparse(text: str) -> list[str]:
+    return [token.lower() for token in re.findall(r"[A-Za-z0-9_.-]+", text)]
+
+
+def _apply_sparse_rerank(results: list[RetrievedChunk], query: str, weight: float) -> list[RetrievedChunk]:
+    if not results or BM25Okapi is None:
+        return results
+
+    reranked_results = [RetrievedChunk(**asdict(item)) for item in results]
+
+    query_tokens = _tokenize_for_sparse(query)
+    if not query_tokens:
+        return reranked_results
+
+    tokenized_corpus: list[list[str]] = []
+    for item in reranked_results:
+        section_heading = str(item.metadata.get("section_heading", ""))
+        tokenized_corpus.append(_tokenize_for_sparse(f"{item.text}\n{section_heading}"))
+
+    if not any(tokenized_corpus):
+        return reranked_results
+
+    try:
+        bm25 = BM25Okapi(tokenized_corpus)
+        sparse_scores = bm25.get_scores(query_tokens)
+    except Exception:
+        return reranked_results
+
+    if len(sparse_scores) != len(reranked_results):
+        return reranked_results
+
+    positive_scores = [float(score) for score in sparse_scores if float(score) > 0.0]
+    if not positive_scores:
+        return reranked_results
+
+    max_positive = max(positive_scores)
+    if max_positive <= 0.0:
+        return reranked_results
+
+    for index, item in enumerate(reranked_results):
+        normalized_sparse = max(0.0, float(sparse_scores[index])) / max_positive
+        if normalized_sparse <= 0.0:
+            continue
+        sparse_bonus = min(0.25, normalized_sparse * weight)
+        item.rerank_score = round(min(1.0, max(0.0, item.rerank_score + sparse_bonus)), 4)
+
+    return reranked_results
+
+
 def _inject_invoice_deadline_evidence(results: list[RetrievedChunk]) -> list[RetrievedChunk]:
     def priority(item: RetrievedChunk) -> int:
         haystack = f"{item.text}\n{item.metadata.get('section_heading', '')}".lower()
@@ -5034,445 +6063,71 @@ def _section_context_bonus(query: str, metadata: dict[str, Any]) -> float:
 # FILE: src/retrieval/__init__.py
 ################################################################################
 
-"""Retrieval layer: dense, sparse, and hybrid search implementations."""
+"""Legacy retrieval package.
 
-from src.retrieval.dense_retriever import DenseRetriever
-from src.retrieval.hybrid_retriever import HybridRetriever, rrf_merge
-from src.retrieval.sparse_retriever import SparseRetriever
+Retrieval is now consolidated in src.pipeline.retriever using Chroma-backed
+ClauseAwareRetriever with optional BM25 reranking.
+"""
 
-__all__ = ["DenseRetriever", "SparseRetriever", "HybridRetriever", "rrf_merge"]
+__all__: list[str] = []
 
 
 ################################################################################
-# FILE: src/retrieval/dense_retriever.py
+# FILE: src/utils/embeddings.py
 ################################################################################
-
-from __future__ import annotations
 
 import hashlib
-import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
 import numpy as np
-
-try:
-    from langchain_community.vectorstores import FAISS
-except Exception:
-    FAISS = None
-
-try:
-    from langchain_core.embeddings import Embeddings
-except Exception:
-    class Embeddings:  # type: ignore[no-redef]
-        pass
-
-try:
-    from dotenv import load_dotenv
-except Exception:
-    def load_dotenv() -> bool:  # type: ignore[no-redef]
-        return False
-
-try:
-    from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
-except Exception:
-    HuggingFaceInferenceAPIEmbeddings = None
-
-DEFAULT_FAISS_DIR = Path("data/processed/faiss_index")
-
-
-load_dotenv()
-
-
-from src.utils.embeddings import HashEmbeddings, get_hash_embeddings
-
-
-def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
-    hf_token = os.getenv("HF_TOKEN", "").strip()
-    if HuggingFaceInferenceAPIEmbeddings is not None and hf_token:
-        embedding_kwargs: dict[str, Any] = {
-            "api_key": hf_token,
-            "model_name": model_name,
-        }
-        api_url = os.getenv("HF_EMBEDDING_API_URL", "").strip()
-        if api_url:
-            embedding_kwargs["api_url"] = api_url
-        return HuggingFaceInferenceAPIEmbeddings(**embedding_kwargs)
-
-    return get_hash_embeddings()
-
-
-@dataclass
-class DenseResult:
-    chunk_id: str
-    text: str
-    metadata: dict[str, Any]
-    score: float
-    rank: int
-    retriever: str = "dense"
-
-
-class DenseRetriever:
-    def __init__(
-        self,
-        index_dir: Path | str = DEFAULT_FAISS_DIR,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    ) -> None:
-        self.index_dir = Path(index_dir)
-        self.embedding_model = embedding_model
-        self.vector_store: Any | None = None
-        self.reload()
-
-    def reload(self) -> None:
-        if FAISS is None:
-            raise RuntimeError("langchain-community is required for FAISS retrieval.")
-
-        if not self.index_dir.exists():
-            raise FileNotFoundError(
-                f"FAISS index directory not found: {self.index_dir}. Run embedding pipeline first."
-            )
-
-        embeddings = resolve_embeddings(model_name=self.embedding_model)
-        # SECURITY WARNING: allow_dangerous_deserialization=True is extremely unsafe since FAISS pickle
-        # deserialization can execute arbitrary code. Ensure that the index_dir
-        # is fully trusted and generated locally.
-        self.vector_store = FAISS.load_local(
-            str(self.index_dir),
-            embeddings,
-            allow_dangerous_deserialization=True,
-        )
-
-    def get_top_k(self, query: str, k: int = 20) -> list[DenseResult]:
-        if self.vector_store is None:
-            raise RuntimeError("Dense retriever is not initialized.")
-
-        raw_results = self.vector_store.similarity_search_with_score(query, k=k)
-        results: list[DenseResult] = []
-
-        for rank, (document, score) in enumerate(raw_results, start=1):
-            metadata = dict(document.metadata or {})
-            chunk_id = str(metadata.get("chunk_id", f"dense_{rank}"))
-            results.append(
-                DenseResult(
-                    chunk_id=chunk_id,
-                    text=document.page_content,
-                    metadata=metadata,
-                    score=float(score),
-                    rank=rank,
-                )
-            )
-
-        return results
-
-
-################################################################################
-# FILE: src/retrieval/hybrid_retriever.py
-################################################################################
-
-from __future__ import annotations
-
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
-
-from src.retrieval.dense_retriever import DEFAULT_FAISS_DIR, DenseRetriever
-from src.retrieval.sparse_retriever import DEFAULT_BM25_PATH, DEFAULT_CHUNKS_PATH, SparseRetriever
-
-RRF_K = 60
-
-
-@dataclass
-class HybridResult:
-    chunk_id: str
-    text: str
-    metadata: dict[str, Any]
-    dense_score: float | None
-    sparse_score: float | None
-    dense_rank: int | None
-    sparse_rank: int | None
-    fused_score: float
-
-
-def rrf_merge(
-    dense_results: list[Any],
-    sparse_results: list[Any],
-    k: int = RRF_K,
-) -> list[HybridResult]:
-    merged: dict[str, HybridResult] = {}
-
-    for rank, result in enumerate(dense_results, start=1):
-        chunk_id = str(result.chunk_id)
-        if chunk_id not in merged:
-            merged[chunk_id] = HybridResult(
-                chunk_id=chunk_id,
-                text=str(result.text),
-                metadata=dict(result.metadata),
-                dense_score=float(result.score),
-                sparse_score=None,
-                dense_rank=rank,
-                sparse_rank=None,
-                fused_score=0.0,
-            )
-        merged[chunk_id].dense_rank = rank
-        merged[chunk_id].dense_score = float(result.score)
-        merged[chunk_id].fused_score += 1.0 / (rank + k)
-
-    for rank, result in enumerate(sparse_results, start=1):
-        chunk_id = str(result.chunk_id)
-        if chunk_id not in merged:
-            merged[chunk_id] = HybridResult(
-                chunk_id=chunk_id,
-                text=str(result.text),
-                metadata=dict(result.metadata),
-                dense_score=None,
-                sparse_score=float(result.score),
-                dense_rank=None,
-                sparse_rank=rank,
-                fused_score=0.0,
-            )
-        merged[chunk_id].sparse_rank = rank
-        merged[chunk_id].sparse_score = float(result.score)
-        merged[chunk_id].fused_score += 1.0 / (rank + k)
-
-    return sorted(merged.values(), key=lambda item: item.fused_score, reverse=True)
-
-
-class HybridRetriever:
-    def __init__(
-        self,
-        dense_retriever: DenseRetriever,
-        sparse_retriever: SparseRetriever,
-    ) -> None:
-        self.dense_retriever = dense_retriever
-        self.sparse_retriever = sparse_retriever
-
-    @classmethod
-    def from_artifacts(
-        cls,
-        faiss_dir: Path | str = DEFAULT_FAISS_DIR,
-        chunks_path: Path | str = DEFAULT_CHUNKS_PATH,
-        bm25_path: Path | str = DEFAULT_BM25_PATH,
-    ) -> "HybridRetriever":
-        dense = DenseRetriever(index_dir=faiss_dir)
-        sparse = SparseRetriever(chunks_path=chunks_path, index_path=bm25_path)
-        return cls(dense_retriever=dense, sparse_retriever=sparse)
-
-    def refresh(self) -> None:
-        self.dense_retriever.reload()
-        self.sparse_retriever.reload()
-
-    def get_top_k(
-        self,
-        query: str,
-        k: int = 5,
-        dense_k: int = 20,
-        sparse_k: int = 20,
-    ) -> list[dict[str, Any]]:
-        dense_results = self.dense_retriever.get_top_k(query=query, k=dense_k)
-        sparse_results = self.sparse_retriever.get_top_k(query=query, k=sparse_k)
-        fused_results = rrf_merge(dense_results, sparse_results, k=RRF_K)
-        return [asdict(item) for item in fused_results[:k]]
-
-
-################################################################################
-# FILE: src/retrieval/sparse_retriever.py
-################################################################################
-
-from __future__ import annotations
-
-import json
-import pickle
-import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-
-try:
-    from rank_bm25 import BM25Okapi
-except Exception:
-    class BM25Okapi:  # type: ignore[no-redef]
-        def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
-            self.corpus = corpus
-            self.k1 = k1
-            self.b = b
-            self.doc_count = len(corpus)
-            self.avgdl = float(sum(len(doc) for doc in corpus)) / max(self.doc_count, 1)
-
-            self.doc_freqs: list[dict[str, int]] = []
-            self.df: dict[str, int] = {}
-            for doc in corpus:
-                freqs: dict[str, int] = {}
-                for token in doc:
-                    freqs[token] = freqs.get(token, 0) + 1
-                self.doc_freqs.append(freqs)
-
-                for token in freqs:
-                    self.df[token] = self.df.get(token, 0) + 1
-
-        def _idf(self, token: str) -> float:
-            n_q = self.df.get(token, 0)
-            numerator = self.doc_count - n_q + 0.5
-            denominator = n_q + 0.5
-            return float(np.log((numerator / max(denominator, 1e-12)) + 1.0))
-
-        def get_scores(self, query_tokens: list[str]) -> np.ndarray:
-            scores = np.zeros(self.doc_count, dtype=np.float64)
-            if self.doc_count == 0:
-                return scores
-
-            for doc_idx, freqs in enumerate(self.doc_freqs):
-                doc_len = len(self.corpus[doc_idx])
-                for token in query_tokens:
-                    if token not in freqs:
-                        continue
-                    tf = freqs[token]
-                    idf = self._idf(token)
-                    numerator = tf * (self.k1 + 1.0)
-                    denominator = tf + self.k1 * (1.0 - self.b + self.b * (doc_len / max(self.avgdl, 1e-12)))
-                    scores[doc_idx] += idf * (numerator / max(denominator, 1e-12))
-
-            return scores
-
-DEFAULT_CHUNKS_PATH = Path("data/processed/chunks.jsonl")
-DEFAULT_BM25_PATH = Path("data/processed/bm25_index.pkl")
-TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
-
-
-@dataclass
-class SparseResult:
-    chunk_id: str
-    text: str
-    metadata: dict[str, Any]
-    score: float
-    rank: int
-    retriever: str = "sparse"
-
-
-def tokenize(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_PATTERN.findall(text)]
-
-
-def load_chunks(chunks_path: Path | str = DEFAULT_CHUNKS_PATH) -> list[dict[str, Any]]:
-    path = Path(chunks_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Chunk file not found: {path}")
-
-    chunks: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as file:
-        for line in file:
-            if line.strip():
-                chunks.append(json.loads(line))
-    return chunks
-
-
-def build_and_save_bm25(chunks: list[dict[str, Any]], output_path: Path | str = DEFAULT_BM25_PATH) -> Path:
-    payload = []
-    for chunk in chunks:
-        payload.append(
-            {
-                "chunk_id": chunk.get("chunk_id"),
-                "text": chunk.get("text", ""),
-                "metadata": chunk.get("metadata", {}),
-                "tokens": tokenize(chunk.get("text", "")),
-            }
-        )
-
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("wb") as file:
-        pickle.dump(payload, file)
-    return output
-
-
-class SparseRetriever:
-    def __init__(
-        self,
-        chunks_path: Path | str = DEFAULT_CHUNKS_PATH,
-        index_path: Path | str = DEFAULT_BM25_PATH,
-    ) -> None:
-        self.chunks_path = Path(chunks_path)
-        self.index_path = Path(index_path)
-
-        self.documents: list[dict[str, Any]] = []
-        self.tokenized_corpus: list[list[str]] = []
-        self.bm25: BM25Okapi | None = None
-
-        self.reload()
-
-    def reload(self) -> None:
-        if self.index_path.exists():
-            with self.index_path.open("rb") as file:
-                stored_docs = pickle.load(file)
-            self.documents = stored_docs
-        elif self.chunks_path.exists():
-            chunks = load_chunks(self.chunks_path)
-            self.documents = [
-                {
-                    "chunk_id": chunk.get("chunk_id"),
-                    "text": chunk.get("text", ""),
-                    "metadata": chunk.get("metadata", {}),
-                    "tokens": tokenize(chunk.get("text", "")),
-                }
-                for chunk in chunks
-            ]
-            build_and_save_bm25(chunks=chunks, output_path=self.index_path)
-        else:
-            raise FileNotFoundError(
-                f"Neither BM25 index ({self.index_path}) nor chunks file ({self.chunks_path}) exists."
-            )
-
-        self.tokenized_corpus = [doc["tokens"] for doc in self.documents]
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
-
-    def get_top_k(self, query: str, k: int = 20) -> list[SparseResult]:
-        if self.bm25 is None:
-            raise RuntimeError("Sparse retriever is not initialized.")
-
-        query_tokens = tokenize(query)
-        scores = self.bm25.get_scores(query_tokens)
-        if len(scores) == 0:
-            return []
-
-        top_indices = np.argsort(scores)[::-1][:k]
-        results: list[SparseResult] = []
-
-        for rank, index in enumerate(top_indices, start=1):
-            score = float(scores[index])
-            if score <= 0:
-                continue
-
-            doc = self.documents[int(index)]
-            results.append(
-                SparseResult(
-                    chunk_id=str(doc["chunk_id"]),
-                    text=str(doc["text"]),
-                    metadata=dict(doc["metadata"]),
-                    score=score,
-                    rank=rank,
-                )
-            )
-
-        return results
+from langchain_core.embeddings import Embeddings
+
+class HashEmbeddings(Embeddings):
+    """Deterministic local fallback embeddings for fully offline operation."""
+
+    def __init__(self, dimensions: int = 384) -> None:
+        self.dimensions = dimensions
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_text(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_text(text)
+
+    def _embed_text(self, text: str) -> list[float]:
+        vector = np.zeros(self.dimensions, dtype=np.float32)
+        for token in text.lower().split():
+            token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
+            index = int(token_hash, 16) % self.dimensions
+            vector[index] += 1.0
+
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector /= norm
+        return vector.tolist()
+
+_shared_hash_embeddings: HashEmbeddings | None = None
+
+def get_hash_embeddings(dimensions: int = 384) -> HashEmbeddings:
+    """Return a singleton instance of HashEmbeddings to prevent memory state duplication."""
+    global _shared_hash_embeddings
+    if _shared_hash_embeddings is None or _shared_hash_embeddings.dimensions != dimensions:
+        _shared_hash_embeddings = HashEmbeddings(dimensions=dimensions)
+    return _shared_hash_embeddings
 
 
 ################################################################################
 # FILE: tests/test_agent.py
 ################################################################################
 
-from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+
 
 from src.agent.agent import LegalContractAgent
 
 
-@dataclass
 class _LLMMessage:
-    content: str
+    def __init__(self, content: str) -> None:
+        self.content = content
 
 
 class _FakeLLM:
@@ -5488,11 +6143,17 @@ class _FakeLLM:
         return _LLMMessage("Grounded answer based on provided context. [chunk_id=c1]")
 
 
-class _FakeHybridRetriever:
+class _FakeContractRetriever:
     def __init__(self, return_empty: bool = False) -> None:
         self.return_empty = return_empty
 
-    def get_top_k(self, query: str, k: int = 5, dense_k: int = 20, sparse_k: int = 20):
+    def get_top_k(
+        self,
+        query: str,
+        contract_id: str | None = None,
+        k: int = 5,
+        clause_hints: list[str] | None = None,
+    ):
         if self.return_empty:
             return []
         return [
@@ -5510,7 +6171,7 @@ class _FakeHybridRetriever:
 
 
 def test_agent_routes_to_contract_search() -> None:
-    agent = LegalContractAgent(hybrid_retriever=_FakeHybridRetriever(), llm=_FakeLLM(route_tool="contract_search"))
+    agent = LegalContractAgent(clause_retriever=_FakeContractRetriever(), llm=_FakeLLM(route_tool="contract_search"))
     result = agent.run("What is the indemnification cap?")
 
     assert result["tool_used"] == "contract_search"
@@ -5519,7 +6180,7 @@ def test_agent_routes_to_contract_search() -> None:
 
 
 def test_agent_routes_to_web_search() -> None:
-    agent = LegalContractAgent(hybrid_retriever=_FakeHybridRetriever(), llm=_FakeLLM(route_tool="web_search"))
+    agent = LegalContractAgent(clause_retriever=_FakeContractRetriever(), llm=_FakeLLM(route_tool="web_search"))
     result = agent.run("What is the market indemnity cap in SaaS deals?")
 
     assert result["tool_used"] == "web_search"
@@ -5527,7 +6188,7 @@ def test_agent_routes_to_web_search() -> None:
 
 def test_agent_falls_back_to_web_when_contract_has_no_results() -> None:
     agent = LegalContractAgent(
-        hybrid_retriever=_FakeHybridRetriever(return_empty=True),
+        clause_retriever=_FakeContractRetriever(return_empty=True),
         llm=_FakeLLM(route_tool="contract_search"),
     )
     result = agent.run("Find the termination clause")
@@ -5537,21 +6198,215 @@ def test_agent_falls_back_to_web_when_contract_has_no_results() -> None:
 
 
 ################################################################################
+# FILE: tests/test_artifact_store.py
+################################################################################
+
+
+import uuid
+
+import pytest
+
+from src.pipeline.artifact_store import ContractArtifactStore
+from src.pipeline import embedder as pipeline_embedder
+from src.utils.embeddings import get_hash_embeddings
+
+
+class _FakeArtifactStore:
+    def __init__(self, chunks: list[dict[str, object]], revision: str) -> None:
+        self.db_enabled = True
+        self._chunks = chunks
+        self._revision = revision
+
+    def chunk_count(self) -> int:
+        return len(self._chunks)
+
+    def chunk_revision(self) -> str:
+        return self._revision
+
+    def load_all_chunks(self, contract_ids: list[str] | None = None, limit: int | None = None):
+        _ = contract_ids
+        _ = limit
+        return list(self._chunks)
+
+    def replace_contract_chunks(self, chunks: list[dict[str, object]]) -> int:
+        self._chunks = list(chunks)
+        return len(self._chunks)
+
+
+class _FakeStore:
+    def __init__(self) -> None:
+        self.docs: dict[str, tuple[str, dict[str, object]]] = {}
+        self.persist_calls = 0
+
+    def add_texts(self, texts: list[str], metadatas: list[dict[str, object]], ids: list[str]) -> None:
+        for chunk_id, text, metadata in zip(ids, texts, metadatas):
+            self.docs[str(chunk_id)] = (str(text), dict(metadata))
+
+    def get(self, include=None):
+        _ = include
+        return {"ids": list(self.docs.keys())}
+
+    def delete(self, ids=None, where=None):
+        if ids is not None:
+            for chunk_id in ids:
+                self.docs.pop(str(chunk_id), None)
+            return
+        _ = where
+        self.docs.clear()
+
+    def persist(self) -> None:
+        self.persist_calls += 1
+
+
+def test_artifact_store_db_round_trip(tmp_path) -> None:
+    db_path = tmp_path / "artifacts.db"
+    database_url = f"sqlite:///{db_path}"
+
+    store = ContractArtifactStore(backend="db", database_url=database_url)
+    assert store.db_enabled is True
+
+    store.upsert_contract_text(
+        contract_id="contract_x",
+        source_name="ContractX.pdf",
+        raw_text="Master services agreement text.",
+        raw_text_path="data/raw/uploads/contract_x.txt",
+        uploaded_at="2026-04-07T10:00:00",
+    )
+
+    inserted = store.replace_contract_chunks(
+        [
+            {
+                "chunk_id": "contract_x_0",
+                "text": "Payment obligations and invoice deadlines.",
+                "metadata": {
+                    "contract_id": "contract_x",
+                    "contract_name": "contract_x",
+                    "clause_type": "payment",
+                },
+            }
+        ]
+    )
+    assert inserted == 1
+
+    contract_text = store.get_contract_text("contract_x")
+    assert contract_text is not None
+    assert contract_text["source_name"] == "ContractX.pdf"
+
+    second_store = ContractArtifactStore(backend="db", database_url=database_url)
+    chunks = second_store.load_all_chunks(contract_ids=["contract_x"])
+    assert len(chunks) == 1
+    assert chunks[0]["chunk_id"] == "contract_x_0"
+    assert chunks[0]["metadata"]["clause_type"] == "payment"
+
+
+def test_vector_store_bootstraps_from_db_artifacts(tmp_path, monkeypatch) -> None:
+    if pipeline_embedder.Chroma is None:
+        pytest.skip("Chroma backend is not installed")
+
+    db_path = tmp_path / "artifacts.db"
+    database_url = f"sqlite:///{db_path}"
+
+    artifact_store = ContractArtifactStore(backend="db", database_url=database_url)
+    artifact_store.replace_contract_chunks(
+        [
+            {
+                "chunk_id": "contract_y_0",
+                "text": "The indemnification cap is limited to direct damages.",
+                "metadata": {
+                    "contract_id": "contract_y",
+                    "contract_name": "contract_y",
+                    "clause_type": "indemnification",
+                },
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        pipeline_embedder,
+        "resolve_embeddings",
+        lambda model_name: get_hash_embeddings(),
+    )
+
+    collection_name = f"contracts_test_{uuid.uuid4().hex[:8]}"
+    vector_store = pipeline_embedder.ContractVectorStore(
+        persist_directory=tmp_path / "chroma",
+        collection_name=collection_name,
+        artifact_store=artifact_store,
+    )
+
+    store = vector_store.get_store()
+    results = store.similarity_search(query="indemnification cap", k=3)
+
+    assert results
+    assert any(
+        str(getattr(doc, "metadata", {}).get("contract_id", "")) == "contract_y"
+        for doc in results
+    )
+
+
+def test_vector_store_refreshes_when_artifact_revision_changes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        pipeline_embedder,
+        "resolve_embeddings",
+        lambda model_name: get_hash_embeddings(),
+    )
+
+    initial_chunks = [
+        {
+            "chunk_id": "contract_z_0",
+            "text": "Initial chunk text.",
+            "metadata": {"contract_id": "contract_z", "contract_name": "contract_z"},
+        }
+    ]
+    artifact_store = _FakeArtifactStore(chunks=initial_chunks, revision="rev_1")
+    local_store = _FakeStore()
+
+    vector_store = pipeline_embedder.ContractVectorStore(
+        persist_directory=tmp_path / "chroma_fake",
+        collection_name="contracts_fake_refresh",
+        artifact_store=artifact_store,
+    )
+    vector_store.sync_interval_seconds = 0.0
+
+    vector_store._sync_from_artifact_store_if_needed(local_store)
+    assert set(local_store.docs.keys()) == {"contract_z_0"}
+    assert local_store.docs["contract_z_0"][0] == "Initial chunk text."
+
+    artifact_store._chunks = [
+        {
+            "chunk_id": "contract_z_0",
+            "text": "Updated chunk text.",
+            "metadata": {"contract_id": "contract_z", "contract_name": "contract_z"},
+        },
+        {
+            "chunk_id": "contract_z_1",
+            "text": "Newly added chunk.",
+            "metadata": {"contract_id": "contract_z", "contract_name": "contract_z"},
+        },
+    ]
+    artifact_store._revision = "rev_2"
+
+    vector_store._sync_from_artifact_store_if_needed(local_store)
+    assert set(local_store.docs.keys()) == {"contract_z_0", "contract_z_1"}
+    assert local_store.docs["contract_z_0"][0] == "Updated chunk text."
+    assert local_store.docs["contract_z_1"][0] == "Newly added chunk."
+
+
+################################################################################
 # FILE: tests/test_api.py
 ################################################################################
 
-from __future__ import annotations
 
-from dataclasses import dataclass
+
 
 import pytest
 from fastapi.testclient import TestClient
 
 from src.api.main import create_app
 from src.evaluation.metrics_store import MetricsStore
+from src.pipeline.chat_scope_registry import ChatScopeRegistry
 
 
-@dataclass
 class _FakeEvaluator:
     def evaluate_single(self, question: str, answer: str, contexts: list[str], ground_truth: str = ""):
         return {
@@ -5562,36 +6417,78 @@ class _FakeEvaluator:
         }
 
 
-@dataclass
-class _FakeAgent:
-    def run(self, query: str, contract_id: str | None = None):
-        return {
-            "answer": "The indemnification cap is limited to direct damages.",
-            "tool_used": "contract_search",
-            "route_reason": "Query is about a contract clause.",
-            "used_web_fallback": False,
-            "citations": [
-                {
-                    "chunk_id": "c1",
-                    "contract_name": "sample_contract",
-                    "clause_type": "indemnification",
-                    "page_number": 4,
-                    "url": "",
-                }
-            ],
-            "source_chunks": [
-                {
-                    "chunk_id": "c1",
-                    "text": "Indemnification clause text",
-                    "metadata": {"contract_name": "sample_contract", "clause_type": "indemnification"},
-                }
-            ],
-        }
-
-
-@dataclass
 class _FakePipeline:
-    def ask(self, question: str, contract_id: str | None = None, ground_truth: str = ""):
+    def __init__(self) -> None:
+        self._uploaded_contracts: list[dict[str, str | int]] = []
+
+    def ask(
+        self,
+        question: str,
+        contract_id: str | None = None,
+        ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
+    ):
+        if allowed_contract_ids is not None:
+            allowed = {str(item).strip() for item in allowed_contract_ids if str(item).strip()}
+            if contract_id and contract_id not in allowed:
+                return {
+                    "answer": "This contract does not contain a clause addressing that.",
+                    "tool_used": "pipeline_contract_search",
+                    "route_reason": "No relevant chunks were found in contracts available to this chat.",
+                    "used_web_fallback": False,
+                    "matched_clause_hints": [],
+                    "sources": [],
+                    "evaluation": {
+                        "faithfulness": 0.0,
+                        "answer_relevance": 0.0,
+                        "context_precision": 0.0,
+                        "context_recall": 0.0,
+                    },
+                    "citations": [],
+                    "source_chunks": [],
+                }
+
+        if "indemnification" in question.lower():
+            return {
+                "answer": "The indemnification cap is limited to direct damages. [1]\n\nSources:\n[1] sample_contract.pdf",
+                "tool_used": "pipeline_contract_search",
+                "route_reason": "Retrieved top contract chunks from vector search.",
+                "used_web_fallback": False,
+                "matched_clause_hints": ["indemnification"],
+                "sources": [
+                    {
+                        "index": 1,
+                        "label": "sample_contract.pdf",
+                        "contract_id": contract_id or "sample_contract",
+                    }
+                ],
+                "evaluation": {
+                    "faithfulness": 0.91,
+                    "answer_relevance": 0.9,
+                    "context_precision": 0.87,
+                    "context_recall": 0.85,
+                },
+                "citations": [
+                    {
+                        "chunk_id": "c1",
+                        "contract_name": contract_id or "sample_contract",
+                        "clause_type": "indemnification",
+                        "page_number": 4,
+                        "url": "",
+                    }
+                ],
+                "source_chunks": [
+                    {
+                        "chunk_id": "c1",
+                        "text": "Indemnification clause text",
+                        "metadata": {
+                            "contract_name": contract_id or "sample_contract",
+                            "clause_type": "indemnification",
+                        },
+                    }
+                ],
+            }
+
         return {
             "answer": "Termination for convenience requires 30 days written notice. [1]\n\nSources:\n[1] sample_contract.pdf",
             "tool_used": "pipeline_contract_search",
@@ -5635,14 +6532,24 @@ class _FakePipeline:
     def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None):
         if not file_bytes:
             raise ValueError("Uploaded file is empty")
+        resolved_contract_id = contract_id or "fake_contract_20260407000000"
+        self._uploaded_contracts.append(
+            {
+                "contract_id": resolved_contract_id,
+                "display_name": filename,
+                "source_name": filename,
+                "chunks_ingested": 3,
+                "uploaded_at": "2026-04-07T00:00:00",
+            }
+        )
         return {
-            "contract_id": contract_id or "fake_contract_20260407000000",
+            "contract_id": resolved_contract_id,
             "chunks_ingested": 3,
             "message": "Contract uploaded and indexed successfully.",
         }
 
     def list_contracts(self):
-        return [
+        static_contracts = [
             {
                 "contract_id": "sample_contract_20260407010101",
                 "display_name": "Sample Contract",
@@ -5659,18 +6566,40 @@ class _FakePipeline:
             },
         ]
 
+        return list(self._uploaded_contracts) + static_contracts
+
+
+class _FailingAskPipeline(_FakePipeline):
+    def ask(
+        self,
+        question: str,
+        contract_id: str | None = None,
+        ground_truth: str = "",
+        allowed_contract_ids: list[str] | None = None,
+    ):
+        raise RuntimeError("sensitive backend detail")
+
+
+class _FailingIngestPipeline(_FakePipeline):
+    def ingest_upload(self, filename: str, file_bytes: bytes, contract_id: str | None = None):
+        raise RuntimeError("internal parse failure detail")
+
+
+def _override_app_state(app, tmp_path, pipeline) -> None:
+    db_path = tmp_path / "test_metrics.db"
+    store = MetricsStore(database_url=f"sqlite:///{db_path}")
+    store.init_db()
+    app.state.metrics_store = store
+    app.state.evaluator = _FakeEvaluator()
+    app.state.pipeline = pipeline
+    app.state.chat_scope_registry = ChatScopeRegistry(registry_path=tmp_path / "chat_scope_registry.json")
+
 
 @pytest.fixture
 def client(tmp_path):
-    db_path = tmp_path / "test_metrics.db"
     app = create_app()
     with TestClient(app) as test_client:
-        store = MetricsStore(database_url=f"sqlite:///{db_path}")
-        store.init_db()
-        app.state.metrics_store = store
-        app.state.evaluator = _FakeEvaluator()
-        app.state.agent = _FakeAgent()
-        app.state.pipeline = _FakePipeline()
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
         yield test_client
 
 
@@ -5678,7 +6607,7 @@ def test_query_endpoint_returns_answer(client: TestClient) -> None:
     response = client.post("/query", json={"query": "What is the indemnification cap?", "contract_id": None})
     assert response.status_code == 200
     payload = response.json()
-    assert payload["tool_used"] == "contract_search"
+    assert payload["tool_used"] == "pipeline_contract_search"
     assert "indemnification cap" in payload["answer"].lower()
 
 
@@ -5736,15 +6665,140 @@ def test_upload_endpoint_accepts_multiple_files(client: TestClient) -> None:
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["chat_id"]
     assert payload["total_files"] == 2
     assert len(payload["uploads"]) == 2
+
+
+def test_chat_scoped_contract_visibility_and_access(client: TestClient) -> None:
+    upload_a = client.post(
+        "/upload",
+        data={"chat_id": "chat_a"},
+        files={"file": ("chat_a_doc.txt", b"Contract text for chat A", "text/plain")},
+    )
+    assert upload_a.status_code == 200
+    contract_a = upload_a.json()["contract_id"]
+
+    upload_b = client.post(
+        "/upload",
+        data={"chat_id": "chat_b"},
+        files={"file": ("chat_b_doc.txt", b"Contract text for chat B", "text/plain")},
+    )
+    assert upload_b.status_code == 200
+    contract_b = upload_b.json()["contract_id"]
+
+    contracts_a = client.get("/contracts", params={"chat_id": "chat_a"})
+    assert contracts_a.status_code == 200
+    returned_a = {item["contract_id"] for item in contracts_a.json()["contracts"]}
+    assert contract_a in returned_a
+    assert contract_b not in returned_a
+
+    contracts_b = client.get("/contracts", params={"chat_id": "chat_b"})
+    assert contracts_b.status_code == 200
+    returned_b = {item["contract_id"] for item in contracts_b.json()["contracts"]}
+    assert contract_b in returned_b
+    assert contract_a not in returned_b
+
+    allowed_query = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "chat_id": "chat_a",
+            "contract_id": contract_a,
+        },
+    )
+    assert allowed_query.status_code == 200
+
+    blocked_query = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "chat_id": "chat_b",
+            "contract_id": contract_a,
+        },
+    )
+    assert blocked_query.status_code == 403
+
+
+def test_query_rejects_contract_without_chat_scope(client: TestClient) -> None:
+    response = client.post(
+        "/query",
+        json={
+            "query": "What is termination for convenience?",
+            "contract_id": "sample_contract_20260407010101",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "chat_id is required when contract_id is provided."
+
+
+def test_auth_middleware_requires_api_key(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("API_AUTH_TOKEN", "secret-token")
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
+
+        unauthorized = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+        )
+        assert unauthorized.status_code == 401
+
+        authorized = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+            headers={"x-api-key": "secret-token"},
+        )
+        assert authorized.status_code == 200
+
+
+def test_strict_scope_policy_requires_chat_id(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("REQUIRE_CHAT_SCOPE", "1")
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FakePipeline())
+
+        query_response = client.post(
+            "/query",
+            json={"query": "What is termination for convenience?"},
+        )
+        assert query_response.status_code == 400
+        assert query_response.json()["detail"] == "chat_id is required by server policy."
+
+        contracts_response = client.get("/contracts")
+        assert contracts_response.status_code == 400
+        assert contracts_response.json()["detail"] == "chat_id is required by server policy."
+
+
+def test_query_error_message_is_sanitized(tmp_path) -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FailingAskPipeline())
+        response = client.post(
+            "/query",
+            json={"query": "What is indemnification?"},
+        )
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Pipeline query failed."
+
+
+def test_upload_error_message_is_sanitized(tmp_path) -> None:
+    app = create_app()
+    with TestClient(app) as client:
+        _override_app_state(app=app, tmp_path=tmp_path, pipeline=_FailingIngestPipeline())
+        response = client.post(
+            "/upload",
+            data={"chat_id": "chat_a"},
+            files={"file": ("sample.txt", b"content", "text/plain")},
+        )
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Pipeline ingestion failed for sample.txt."
 
 
 ################################################################################
 # FILE: tests/test_chunker.py
 ################################################################################
 
-from __future__ import annotations
 
 from src.pipeline.chunker import extract_clause_hints_from_question, infer_clause_type
 
@@ -5777,106 +6831,303 @@ def test_extract_clause_hints_boosts_termination_queries() -> None:
 
 
 ################################################################################
+# FILE: tests/test_ingestion_embedder.py
+################################################################################
+
+
+from pathlib import Path
+from typing import Any
+
+from src.ingestion import embedder as ingestion_embedder
+from src.utils.embeddings import HashEmbeddings
+
+
+class _InvalidEmbeddings:
+    def embed_query(self, text: str) -> dict[str, str]:
+        return {"error": "invalid"}
+
+    def embed_documents(self, texts: list[str]) -> list[dict[str, str]]:
+        return [{"error": "invalid"} for _ in texts]
+
+
+class _RemoteEmbeddings:
+    def embed_query(self, text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
+class _FakeVectorStore:
+    def __init__(self, save_calls: list[str]) -> None:
+        self.save_calls = save_calls
+
+    def save_local(self, output_dir: str) -> None:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        self.save_calls.append(output_dir)
+
+
+def _sample_chunks() -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": "chunk_1",
+            "text": "payment terms and termination clause",
+            "metadata": {"contract_id": "contract_1"},
+        }
+    ]
+
+
+def test_build_faiss_index_falls_back_when_probe_vector_is_invalid(monkeypatch, tmp_path) -> None:
+    embedding_calls: list[object] = []
+    save_calls: list[str] = []
+
+    class _FakeFAISS:
+        @staticmethod
+        def from_texts(texts: list[str], embedding: object, metadatas: list[dict[str, Any]]) -> _FakeVectorStore:
+            embedding_calls.append(embedding)
+            return _FakeVectorStore(save_calls)
+
+    monkeypatch.setattr(ingestion_embedder, "resolve_embeddings", lambda model_name: _InvalidEmbeddings())
+    monkeypatch.setattr(ingestion_embedder, "FAISS", _FakeFAISS)
+
+    output_dir = ingestion_embedder.build_faiss_index(
+        chunks=_sample_chunks(),
+        output_dir=tmp_path / "faiss_invalid_probe",
+    )
+
+    assert output_dir == tmp_path / "faiss_invalid_probe"
+    assert len(embedding_calls) == 1
+    assert isinstance(embedding_calls[0], HashEmbeddings)
+    assert save_calls
+
+
+def test_build_faiss_index_retries_with_hash_embeddings_after_backend_failure(monkeypatch, tmp_path) -> None:
+    embedding_calls: list[object] = []
+    save_calls: list[str] = []
+
+    class _FakeFAISS:
+        @staticmethod
+        def from_texts(texts: list[str], embedding: object, metadatas: list[dict[str, Any]]) -> _FakeVectorStore:
+            embedding_calls.append(embedding)
+            if len(embedding_calls) == 1:
+                raise KeyError(0)
+            return _FakeVectorStore(save_calls)
+
+    monkeypatch.setattr(ingestion_embedder, "resolve_embeddings", lambda model_name: _RemoteEmbeddings())
+    monkeypatch.setattr(ingestion_embedder, "FAISS", _FakeFAISS)
+
+    output_dir = ingestion_embedder.build_faiss_index(
+        chunks=_sample_chunks(),
+        output_dir=tmp_path / "faiss_retry",
+    )
+
+    assert output_dir == tmp_path / "faiss_retry"
+    assert len(embedding_calls) == 2
+    assert not isinstance(embedding_calls[0], HashEmbeddings)
+    assert isinstance(embedding_calls[1], HashEmbeddings)
+    assert save_calls
+
+
+################################################################################
+# FILE: tests/test_registry_backends.py
+################################################################################
+
+
+from src.pipeline.chat_scope_registry import ChatScopeRegistry
+from src.pipeline.contracts_registry import ContractRegistry
+
+
+def test_chat_scope_registry_db_backend_persists_across_instances(tmp_path) -> None:
+    db_path = tmp_path / "registry_state.db"
+    database_url = f"sqlite:///{db_path}"
+
+    first = ChatScopeRegistry(
+        registry_path=tmp_path / "chat_scope_registry.json",
+        backend="db",
+        database_url=database_url,
+    )
+    first.add_contracts("chat_a", ["contract_1", "contract_2", "contract_1"])
+
+    assert first.list_contract_ids("chat_a") == ["contract_1", "contract_2"]
+
+    second = ChatScopeRegistry(
+        registry_path=tmp_path / "chat_scope_registry_other.json",
+        backend="db",
+        database_url=database_url,
+    )
+    assert second.list_contract_ids("chat_a") == ["contract_1", "contract_2"]
+
+
+def test_contract_registry_db_backend_upsert_and_ordering(tmp_path) -> None:
+    db_path = tmp_path / "registry_state.db"
+    database_url = f"sqlite:///{db_path}"
+
+    registry = ContractRegistry(
+        registry_path=tmp_path / "contracts_registry.json",
+        raw_upload_dir=tmp_path / "uploads",
+        chunk_metadata_path=tmp_path / "chunk_metadata.json",
+        backend="db",
+        database_url=database_url,
+    )
+
+    registry.upsert(
+        contract_id="contract_a",
+        source_name="Alpha.pdf",
+        chunks_ingested=3,
+        uploaded_at="2026-04-07T01:00:00",
+    )
+    registry.upsert(
+        contract_id="contract_b",
+        source_name="Beta.pdf",
+        chunks_ingested=4,
+        uploaded_at="2026-04-07T02:00:00",
+    )
+
+    rows = registry.list_contracts()
+    assert [row["contract_id"] for row in rows] == ["contract_b", "contract_a"]
+    assert rows[0]["display_name"] == "Beta"
+
+    # Updating existing contract should move it to top with newer timestamp.
+    registry.upsert(
+        contract_id="contract_a",
+        source_name="Alpha_v2.pdf",
+        chunks_ingested=7,
+        uploaded_at="2026-04-07T03:00:00",
+    )
+
+    updated_rows = registry.list_contracts()
+    assert updated_rows[0]["contract_id"] == "contract_a"
+    assert updated_rows[0]["chunks_ingested"] == 7
+    assert updated_rows[0]["source_name"] == "Alpha_v2.pdf"
+
+    # Ensure data persists across a new registry instance.
+    second_registry = ContractRegistry(
+        registry_path=tmp_path / "contracts_registry_other.json",
+        raw_upload_dir=tmp_path / "uploads",
+        chunk_metadata_path=tmp_path / "chunk_metadata.json",
+        backend="db",
+        database_url=database_url,
+    )
+    persisted_rows = second_registry.list_contracts()
+    assert persisted_rows[0]["contract_id"] == "contract_a"
+    assert {row["contract_id"] for row in persisted_rows} == {"contract_a", "contract_b"}
+
+
+################################################################################
 # FILE: tests/test_retrieval.py
 ################################################################################
 
-from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Any
 
-from src.retrieval.hybrid_retriever import HybridRetriever, rrf_merge
-from src.retrieval.sparse_retriever import SparseRetriever, build_and_save_bm25
-
-
-def _sample_chunks() -> list[dict]:
-    return [
-        {
-            "chunk_id": "c1",
-            "text": "This clause defines indemnification obligations and liability cap.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "indemnification"},
-        },
-        {
-            "chunk_id": "c2",
-            "text": "Termination for convenience is allowed with 30 days written notice.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "termination"},
-        },
-        {
-            "chunk_id": "c3",
-            "text": "Confidential information must not be disclosed to third parties.",
-            "metadata": {"contract_name": "contract_alpha", "clause_type": "confidentiality"},
-        },
-    ]
-
-
-def test_sparse_retriever_returns_expected_chunk(tmp_path: Path) -> None:
-    chunks = _sample_chunks()
-    chunks_path = tmp_path / "chunks.jsonl"
-    index_path = tmp_path / "bm25.pkl"
-
-    with chunks_path.open("w", encoding="utf-8") as file:
-        for chunk in chunks:
-            file.write(json.dumps(chunk) + "\n")
-
-    build_and_save_bm25(chunks=chunks, output_path=index_path)
-
-    retriever = SparseRetriever(chunks_path=chunks_path, index_path=index_path)
-    results = retriever.get_top_k("termination for convenience", k=2)
-
-    assert results
-    assert results[0].chunk_id == "c2"
+from src.pipeline.retriever import BM25Okapi, ClauseAwareRetriever
 
 
 @dataclass
-class _MockResult:
-    chunk_id: str
-    text: str
-    metadata: dict
-    score: float
+class _Doc:
+    page_content: str
+    metadata: dict[str, Any]
 
 
-def test_rrf_merge_prefers_docs_ranked_by_both_retrievers() -> None:
-    dense_results = [
-        _MockResult("a", "dense a", {}, 0.11),
-        _MockResult("b", "dense b", {}, 0.18),
-    ]
-    sparse_results = [
-        _MockResult("b", "sparse b", {}, 4.0),
-        _MockResult("c", "sparse c", {}, 3.5),
-    ]
+class _FakeChromaStore:
+    def __init__(self, results_by_query: dict[str, list[tuple[_Doc, float]]]) -> None:
+        self.results_by_query = results_by_query
 
-    fused = rrf_merge(dense_results, sparse_results, k=60)
-
-    assert fused
-    assert fused[0].chunk_id == "b"
-
-
-class _FakeDenseRetriever:
-    def get_top_k(self, query: str, k: int = 20) -> list[_MockResult]:
-        return [
-            _MockResult("a", "dense text a", {}, 0.2),
-            _MockResult("b", "dense text b", {}, 0.3),
-        ]
-
-    def reload(self) -> None:
-        return None
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int,
+        filter: dict[str, Any] | None = None,
+    ) -> list[tuple[_Doc, float]]:
+        results = list(self.results_by_query.get(query, []))
+        if filter:
+            filtered_results: list[tuple[_Doc, float]] = []
+            for document, score in results:
+                matches = True
+                for key, value in filter.items():
+                    if str(document.metadata.get(key)) != str(value):
+                        matches = False
+                        break
+                if matches:
+                    filtered_results.append((document, score))
+            results = filtered_results
+        return results[:k]
 
 
-class _FakeSparseRetriever:
-    def get_top_k(self, query: str, k: int = 20) -> list[_MockResult]:
-        return [
-            _MockResult("b", "sparse text b", {}, 7.1),
-            _MockResult("c", "sparse text c", {}, 6.9),
-        ]
+class _FakeVectorStore:
+    def __init__(self, store: _FakeChromaStore) -> None:
+        self.store = store
 
-    def reload(self) -> None:
-        return None
+    def get_store(self) -> _FakeChromaStore:
+        return self.store
 
 
-def test_hybrid_retriever_uses_rrf_merge() -> None:
-    hybrid = HybridRetriever(dense_retriever=_FakeDenseRetriever(), sparse_retriever=_FakeSparseRetriever())
-    top = hybrid.get_top_k("indemnification clause", k=2)
+def test_clause_aware_retriever_applies_contract_filter() -> None:
+    query = "termination notice"
+    store = _FakeChromaStore(
+        {
+            query: [
+                (_Doc("Contract A termination terms", {"chunk_id": "a", "contract_id": "contract_a"}), 0.92),
+                (_Doc("Contract B termination terms", {"chunk_id": "b", "contract_id": "contract_b"}), 0.91),
+            ]
+        }
+    )
+    retriever = ClauseAwareRetriever(
+        vector_store=_FakeVectorStore(store),
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=False,
+    )
 
-    assert len(top) == 2
-    assert top[0]["chunk_id"] == "b"
+    results = retriever.get_top_k(query=query, contract_id="contract_b", k=2, clause_hints=[])
+
+    assert results
+    assert all(item.get("metadata", {}).get("contract_id") == "contract_b" for item in results)
+
+
+def test_clause_aware_retriever_sparse_rerank_changes_order() -> None:
+    query = "obligation breach remedy"
+    store = _FakeChromaStore(
+        {
+            query: [
+                (_Doc("obligation breach remedy", {"chunk_id": "a", "contract_id": "contract_a"}), 0.76),
+                (
+                    _Doc(
+                        "obligation obligation obligation breach breach remedy remedy remedy remedy",
+                        {"chunk_id": "b", "contract_id": "contract_a"},
+                    ),
+                    0.75,
+                ),
+            ]
+        }
+    )
+    vector_store = _FakeVectorStore(store)
+
+    without_sparse = ClauseAwareRetriever(
+        vector_store=vector_store,
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=False,
+    )
+    with_sparse = ClauseAwareRetriever(
+        vector_store=vector_store,
+        default_k=2,
+        candidate_k=2,
+        enable_sparse_rerank=True,
+        sparse_rerank_weight=0.3,
+    )
+
+    without_sparse_results = without_sparse.get_top_k(query=query, k=2, clause_hints=[])
+    with_sparse_results = with_sparse.get_top_k(query=query, k=2, clause_hints=[])
+
+    assert without_sparse_results[0]["chunk_id"] == "a"
+
+    if BM25Okapi is None:
+        # Optional dependency path: rerank is skipped when rank_bm25 is unavailable.
+        assert with_sparse_results[0]["chunk_id"] == "a"
+        return
+
+    baseline_by_id = {item["chunk_id"]: item for item in without_sparse_results}
+    sparse_by_id = {item["chunk_id"]: item for item in with_sparse_results}
+    assert sparse_by_id["b"]["rerank_score"] >= baseline_by_id["b"]["rerank_score"]

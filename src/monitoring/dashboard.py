@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import streamlit as st
 from src.evaluation.metrics_store import MetricsStore
@@ -22,7 +24,7 @@ def main() -> None:
     st.title("Legal Contract Analyzer - Monitoring Dashboard")
     st.caption("Real-time quality tracking for faithfulness, relevance, precision, and recall.")
 
-    store = MetricsStore()
+    store = MetricsStore(database_url=os.getenv("DATABASE_URL"))
     trends = store.get_trends(days=7)
     if not trends:
         st.info("No recent metrics available to display.")

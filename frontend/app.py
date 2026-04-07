@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
 
 QUICK_QUESTIONS = [
     "What are the termination conditions?",
@@ -20,44 +21,12 @@ QUICK_QUESTIONS = [
 
 st.set_page_config(page_title="Legal Contract Analyzer", layout="wide")
 
-# Custom CSS for chat bubbles
-st.markdown(
-    '''
-    <style>
-    .chat-bubble-user {
-        background-color: #2b313e;
-        color: white;
-        padding: 10px 15px;
-        border-radius: 15px;
-        margin-bottom: 15px;
-        max-width: 80%;
-        float: right;
-        clear: both;
-    }
-    .chat-bubble-assistant {
-        background-color: #f0f2f6;
-        color: black;
-        padding: 10px 15px;
-        border-radius: 15px;
-        margin-bottom: 15px;
-        max-width: 80%;
-        float: left;
-        clear: both;
-    }
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        width: 100%;
-    }
-    .clearfix::after {
-        content: "";
-        clear: both;
-        display: table;
-    }
-    </style>
-    ''',
-    unsafe_allow_html=True
-)
+
+def _request_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if API_AUTH_TOKEN:
+        headers["x-api-key"] = API_AUTH_TOKEN
+    return headers
 
 if "sessions" not in st.session_state:
     st.session_state.sessions = {}
@@ -69,12 +38,22 @@ if "chat_active_contract" not in st.session_state:
     st.session_state.chat_active_contract = {}
 
 def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=120)
+    response = requests.post(
+        f"{API_BASE_URL}{path}",
+        json=payload,
+        headers=_request_headers(),
+        timeout=120,
+    )
     response.raise_for_status()
     return response.json()
 
 def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    response = requests.get(f"{API_BASE_URL}{path}", params=params or {}, timeout=60)
+    response = requests.get(
+        f"{API_BASE_URL}{path}",
+        params=params or {},
+        headers=_request_headers(),
+        timeout=60,
+    )
     response.raise_for_status()
     return response.json()
 
@@ -95,6 +74,7 @@ def _post_files(path: str, uploads: list[Any], chat_id: str) -> dict[str, Any]:
         f"{API_BASE_URL}{path}",
         files=multipart_files,
         data={"chat_id": chat_id},
+        headers=_request_headers(),
         timeout=600,
     )
     response.raise_for_status()
@@ -201,20 +181,16 @@ st.title("Contract Analyzer")
 current_messages = st.session_state.sessions[st.session_state.current_session_id]
 
 # Display history
-st.markdown('<div class="chat-container">', unsafe_allow_html=True)
 for msg in current_messages:
-    if msg["role"] == "user":
-        st.markdown(f'<div class="chat-bubble-user">{msg["content"]}</div><div class="clearfix"></div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="chat-bubble-assistant">{msg["content"]}</div>', unsafe_allow_html=True)
+    role = "user" if msg["role"] == "user" else "assistant"
+    with st.chat_message(role):
+        st.write(msg["content"])
         if "citations" in msg and msg["citations"]:
             with st.expander("View Source Chunks"):
                 for cit in msg["citations"]:
                     st.markdown(f"**Contract:** {cit.get('contract_name', 'Unknown')}")
                     st.markdown(f"**Chunk:** {cit.get('chunk_id', 'unknown_chunk')}")
                     st.divider()
-        st.markdown('<div class="clearfix"></div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
 # Quick questions handler
 if not current_messages:
@@ -235,8 +211,6 @@ if "quick_query" in st.session_state and st.session_state.quick_query:
 if query:
     # Append user message
     st.session_state.sessions[st.session_state.current_session_id].append({"role": "user", "content": query})
-    st.markdown(f'<div class="chat-bubble-user">{query}</div><div class="clearfix"></div>', unsafe_allow_html=True)
-    
     with st.spinner("Analyzing contract..."):
         try:
             payload = {
@@ -247,14 +221,21 @@ if query:
             result = _post_json("/ask", payload)
             answer = result.get("answer", "No answer generated.")
             citations = result.get("citations", [])
-            
-            # Append assistant message
-            st.session_state.sessions[st.session_state.current_session_id].append({
-                "role": "assistant",
-                "content": answer,
-                "citations": citations
-            })
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"Error querying backend: {e}")
+
+            st.session_state.sessions[st.session_state.current_session_id].append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "citations": citations,
+                }
+            )
+        except Exception as error:
+            st.session_state.sessions[st.session_state.current_session_id].append(
+                {
+                    "role": "assistant",
+                    "content": f"Error querying backend: {error}",
+                    "citations": [],
+                }
+            )
+
+    st.rerun()

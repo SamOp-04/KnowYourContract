@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +13,17 @@ from fastapi.concurrency import run_in_threadpool
 from src.api.schemas import UploadBatchResponse, UploadItemResponse, UploadResponse
 
 router = APIRouter(tags=["upload"])
+logger = logging.getLogger(__name__)
+
+
+def _strict_scope_enabled() -> bool:
+    return os.getenv("REQUIRE_CHAT_SCOPE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _safe_contract_stem(filename: str | None, fallback: str) -> str:
+    stem = Path(filename or fallback).stem
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    return cleaned or fallback
 
 @router.post("/upload", response_model=UploadResponse | UploadBatchResponse)
 async def upload_contract(
@@ -36,6 +50,10 @@ async def upload_contract(
     if chat_scope_registry is None:
         raise HTTPException(status_code=503, detail="Chat scope registry is not initialized.")
 
+    strict_scope = _strict_scope_enabled()
+    if strict_scope and not str(chat_id or "").strip():
+        raise HTTPException(status_code=400, detail="chat_id is required by server policy.")
+
     resolved_chat_id = str(chat_id or "").strip() or str(uuid.uuid4())
 
     upload_results: list[UploadItemResponse] = []
@@ -58,7 +76,7 @@ async def upload_contract(
             )
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-        base_name = Path(upload.filename or f"contract_{index}").stem
+        base_name = _safe_contract_stem(upload.filename, f"contract_{index}")
         contract_id = f"{base_name}_{timestamp}"
 
         try:
@@ -69,9 +87,13 @@ async def upload_contract(
                 contract_id,
             )
         except Exception as error:
+            logger.exception(
+                "Pipeline ingestion failed",
+                extra={"source_filename": upload.filename or contract_id},
+            )
             raise HTTPException(
                 status_code=500,
-                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}: {error}",
+                detail=f"Pipeline ingestion failed for {upload.filename or contract_id}.",
             ) from error
 
         upload_results.append(

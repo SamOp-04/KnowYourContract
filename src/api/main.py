@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 try:
     from dotenv import load_dotenv
@@ -10,7 +12,6 @@ except Exception:
     def load_dotenv() -> bool:  # type: ignore[no-redef]
         return False
 
-from src.agent.agent import LegalContractAgent
 from src.api.routes.ask import router as ask_router
 from src.api.routes.contracts import router as contracts_router
 from src.api.routes.metrics import router as metrics_router
@@ -33,7 +34,6 @@ def create_app() -> FastAPI:
         app.state.evaluator = ContractQAEvaluator(use_llm_judge=True)
         app.state.pipeline = ContractQAPipeline(evaluator=app.state.evaluator)
         app.state.chat_scope_registry = ChatScopeRegistry()
-        app.state.agent = LegalContractAgent(clause_retriever=app.state.pipeline.retriever)
             
         yield
 
@@ -43,6 +43,21 @@ def create_app() -> FastAPI:
         description="Agentic RAG backend for legal contract analysis using CUAD.",
         lifespan=lifespan,
     )
+
+    auth_token = os.getenv("API_AUTH_TOKEN", "").strip()
+    if auth_token:
+        exempt_paths = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+        @app.middleware("http")
+        async def _require_api_token(request, call_next):
+            if request.url.path in exempt_paths:
+                return await call_next(request)
+
+            provided = str(request.headers.get("x-api-key", "")).strip()
+            if not provided or provided != auth_token:
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+            return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

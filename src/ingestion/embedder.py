@@ -64,6 +64,27 @@ def resolve_embeddings(model_name: str = "sentence-transformers/all-MiniLM-L6-v2
     return get_hash_embeddings()
 
 
+def _is_valid_vector(value: Any) -> bool:
+    try:
+        vector = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return False
+
+    if vector.ndim != 1 or vector.size == 0:
+        return False
+
+    return bool(np.isfinite(vector).all())
+
+
+def _embedding_backend_healthy(embeddings: Embeddings) -> bool:
+    try:
+        probe = embeddings.embed_query("embedding healthcheck")
+    except Exception:
+        return False
+
+    return _is_valid_vector(probe)
+
+
 def load_chunks(chunks_path: Path = DEFAULT_OUTPUT_PATH) -> list[dict[str, Any]]:
     if not chunks_path.exists():
         raise FileNotFoundError(
@@ -88,6 +109,12 @@ def build_faiss_index(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     embeddings = resolve_embeddings(model_name=model_name)
+    if not _embedding_backend_healthy(embeddings):
+        print(
+            "Embedding backend returned an invalid probe vector. "
+            "Falling back to deterministic hash embeddings."
+        )
+        embeddings = get_hash_embeddings()
 
     texts = [chunk["text"] for chunk in chunks]
     metadatas = []
@@ -96,7 +123,19 @@ def build_faiss_index(
         metadata["chunk_id"] = chunk.get("chunk_id")
         metadatas.append(metadata)
 
-    vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+    try:
+        vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+    except Exception as exc:
+        if isinstance(embeddings, HashEmbeddings):
+            raise
+
+        print(
+            f"Primary embedding backend failed during index build ({exc}). "
+            "Retrying with deterministic hash embeddings."
+        )
+        embeddings = get_hash_embeddings()
+        vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+
     vector_store.save_local(str(output_dir))
     return output_dir
 

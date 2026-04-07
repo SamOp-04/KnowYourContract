@@ -14,6 +14,8 @@ try:
 except Exception:
     SQLALCHEMY_AVAILABLE = False
 
+from src.utils.db import should_auto_create_tables
+
 DEFAULT_DATABASE_URL = "sqlite:///data/processed/metrics.db"
 
 
@@ -30,6 +32,28 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
         Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+
+
+def _as_utc_naive(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    return parsed
+                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                pass
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 if SQLALCHEMY_AVAILABLE:
@@ -83,7 +107,7 @@ class MetricsStore:
             self.SessionLocal = None
 
     def init_db(self) -> None:
-        if SQLALCHEMY_AVAILABLE:
+        if SQLALCHEMY_AVAILABLE and should_auto_create_tables(self.database_url):
             Base.metadata.create_all(bind=self.engine)
 
     def save_metric(self, payload: dict[str, Any]) -> int:
@@ -98,7 +122,7 @@ class MetricsStore:
                     answer_relevance=float(payload.get("answer_relevance", 0.0)),
                     context_precision=float(payload.get("context_precision", 0.0)),
                     context_recall=float(payload.get("context_recall", 0.0)),
-                    created_at=payload.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None)),
+                    created_at=_as_utc_naive(payload.get("created_at")),
                 )
                 session.add(row)
                 session.commit()
@@ -116,7 +140,7 @@ class MetricsStore:
                 "answer_relevance": float(payload.get("answer_relevance", 0.0)),
                 "context_precision": float(payload.get("context_precision", 0.0)),
                 "context_recall": float(payload.get("context_recall", 0.0)),
-                "created_at": payload.get("created_at", datetime.now(timezone.utc)),
+                "created_at": _as_utc_naive(payload.get("created_at")),
             }
             self._memory_rows.append(row)
         return int(row["id"])
@@ -132,7 +156,7 @@ class MetricsStore:
                 )
                 return [self._to_dict(row) for row in rows]
 
-        sorted_rows = sorted(self._memory_rows, key=lambda row: row["created_at"], reverse=True)
+        sorted_rows = sorted(self._memory_rows, key=lambda row: _as_utc_naive(row.get("created_at")), reverse=True)
         return [self._to_dict(row) for row in sorted_rows[:limit]]
 
     def get_trends(self, days: int = 7) -> list[dict[str, Any]]:
@@ -147,8 +171,8 @@ class MetricsStore:
                 )
                 return [self._to_dict(row) for row in rows]
 
-        rows = [row for row in self._memory_rows if row["created_at"] >= threshold]
-        rows = sorted(rows, key=lambda row: row["created_at"])
+        rows = [row for row in self._memory_rows if _as_utc_naive(row.get("created_at")) >= threshold]
+        rows = sorted(rows, key=lambda row: _as_utc_naive(row.get("created_at")))
         return [self._to_dict(row) for row in rows]
 
     def get_query_analytics(self) -> list[dict[str, Any]]:
@@ -199,11 +223,7 @@ class MetricsStore:
     @staticmethod
     def _to_dict(row: RagasMetricLog) -> dict[str, Any]:
         if isinstance(row, dict):
-            created_at = row.get("created_at", datetime.now(timezone.utc).replace(tzinfo=None))
-            if isinstance(created_at, str):
-                created_iso = created_at
-            else:
-                created_iso = created_at.isoformat()
+            created_iso = _as_utc_naive(row.get("created_at")).isoformat()
             return {
                 "id": int(row.get("id", 0)),
                 "query": str(row.get("query", "")),

@@ -331,8 +331,22 @@ def extract_clause_hints_from_question(question: str) -> list[str]:
     lowered = question.lower()
     boosted_hints: list[str] = []
 
-    if re.search(r"\bterminat(?:e|es|ed|ing|ion)?\b", lowered):
-        boosted_hints.extend(["termination_for_convenience", "termination_for_cause"])
+    has_termination = bool(re.search(r"\bterminat(?:e|es|ed|ing|ion)?\b", lowered))
+    asks_convenience = bool(
+        re.search(r"\b(convenience|without cause|at any time)\b", lowered)
+    )
+    asks_cause = bool(
+        re.search(r"\b(for cause|material breach|default|cure)\b", lowered)
+    )
+
+    if has_termination:
+        if asks_convenience:
+            boosted_hints.append("termination_for_convenience")
+        if asks_cause:
+            boosted_hints.append("termination_for_cause")
+        if not asks_convenience and not asks_cause:
+            boosted_hints.extend(["termination_for_convenience", "termination_for_cause"])
+
     if re.search(r"\brenew(?:al|als|ed|ing)?\b", lowered):
         boosted_hints.extend(["renewal_term", "notice_to_terminate_renewal"])
 

@@ -41,9 +41,11 @@ class AskRequest(QueryRequest):
     @model_validator(mode="before")
     @classmethod
     def _coerce_question_alias(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "query" not in value and "question" in value:
+        if isinstance(value, dict):
             normalized = dict(value)
-            normalized["query"] = normalized.get("question")
+            if "query" not in normalized and "question" in normalized:
+                normalized["query"] = normalized.get("question")
+            normalized.pop("question", None)
             return normalized
         return value
 
