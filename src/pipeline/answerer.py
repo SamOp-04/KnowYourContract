@@ -23,7 +23,9 @@ from src.pipeline.answerer_helpers import (
 class MistralAnswerer:
     model: str = os.getenv("OLLAMA_MODEL", "mistral")
     endpoint: str = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate")
-    timeout_seconds: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
+    timeout_seconds: float = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45"))
+    connect_timeout_seconds: float = float(os.getenv("OLLAMA_CONNECT_TIMEOUT_SECONDS", "5"))
+    cli_timeout_seconds: float = float(os.getenv("OLLAMA_CLI_TIMEOUT_SECONDS", "20"))
     enable_cli_fallback: bool = os.getenv("OLLAMA_CLI_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
 
     def answer(self, question: str, source_chunks: list[dict[str, Any]]) -> str:
@@ -53,7 +55,11 @@ class MistralAnswerer:
                 "stream": False,
                 "options": {"temperature": 0.0},
             }
-            response = requests.post(self.endpoint, json=payload, timeout=max(30.0, self.timeout_seconds))
+            response = requests.post(
+                self.endpoint,
+                json=payload,
+                timeout=(max(1.0, self.connect_timeout_seconds), max(5.0, self.timeout_seconds)),
+            )
             response.raise_for_status()
             body = response.json()
             return str(body.get("response", "")).strip()
@@ -75,7 +81,7 @@ class MistralAnswerer:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(30.0, self.timeout_seconds),
+                timeout=max(5.0, self.cli_timeout_seconds),
                 check=False,
             )
         except Exception:

@@ -38,6 +38,12 @@ TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 _SEMANTIC_MODEL: Any | None = None
 _SEMANTIC_MODEL_NAME: str | None = None
+_SEMANTIC_MODEL_LOAD_FAILED: set[str] = set()
+_SEMANTIC_MODEL_LOCAL_ONLY = os.getenv("HF_EMBEDDING_LOCAL_ONLY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 
 def tokenize(text: str) -> set[str]:
@@ -69,9 +75,18 @@ def _get_semantic_model(model_name: str) -> Any | None:
     if _SEMANTIC_MODEL is not None and _SEMANTIC_MODEL_NAME == model_name:
         return _SEMANTIC_MODEL
 
-    _SEMANTIC_MODEL = SentenceTransformer(model_name)
-    _SEMANTIC_MODEL_NAME = model_name
-    return _SEMANTIC_MODEL
+    if model_name in _SEMANTIC_MODEL_LOAD_FAILED:
+        return None
+
+    try:
+        _SEMANTIC_MODEL = SentenceTransformer(model_name, local_files_only=_SEMANTIC_MODEL_LOCAL_ONLY)
+        _SEMANTIC_MODEL_NAME = model_name
+        return _SEMANTIC_MODEL
+    except Exception:
+        _SEMANTIC_MODEL = None
+        _SEMANTIC_MODEL_NAME = None
+        _SEMANTIC_MODEL_LOAD_FAILED.add(model_name)
+        return None
 
 
 def semantic_similarity(left: str, right: str, model_name: str) -> float:
@@ -247,7 +262,7 @@ class ContractQAEvaluator:
         self._ollama = OllamaJudge(
             model=os.getenv("OLLAMA_MODEL", "mistral"),
             endpoint=os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate"),
-            timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")),
+            timeout_seconds=float(os.getenv("OLLAMA_JUDGE_TIMEOUT_SECONDS", "20")),
         )
 
     def evaluate_single(

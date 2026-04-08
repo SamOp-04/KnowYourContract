@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import shutil
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Chroma telemetry can fail with some posthog versions; default to disabled.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 try:
     from langchain_core.embeddings import Embeddings
@@ -30,6 +38,11 @@ except Exception:
         from langchain_community.vectorstores import Chroma
     except Exception:
         Chroma = None
+
+try:
+    from chromadb.config import Settings as ChromaSettings
+except Exception:
+    ChromaSettings = None
 
 
 from src.utils.embeddings import HashEmbeddings, get_hash_embeddings
@@ -87,14 +100,87 @@ class ContractVectorStore:
 
         if self._store is None:
             self.persist_directory.mkdir(parents=True, exist_ok=True)
-            self._store = Chroma(
-                collection_name=self.collection_name,
-                embedding_function=self.embeddings,
-                persist_directory=str(self.persist_directory),
-            )
+            self._store = self._initialize_store_with_recovery()
 
         self._sync_from_artifact_store_if_needed(store=self._store)
         return self._store
+
+    def _initialize_store_with_recovery(self) -> Any:
+        try:
+            return self._create_chroma_store()
+        except Exception as error:
+            if not self._is_recoverable_chroma_config_error(error):
+                raise
+
+            self._quarantine_persist_directory()
+            self.persist_directory.mkdir(parents=True, exist_ok=True)
+            logger.warning(
+                "Detected incompatible Chroma persisted metadata for collection '%s'; reset local state and retrying.",
+                self.collection_name,
+            )
+            return self._create_chroma_store()
+
+    def _create_chroma_store(self) -> Any:
+        kwargs: dict[str, Any] = {
+            "collection_name": self.collection_name,
+            "embedding_function": self.embeddings,
+            "persist_directory": str(self.persist_directory),
+        }
+
+        if ChromaSettings is not None:
+            try:
+                kwargs["client_settings"] = ChromaSettings(anonymized_telemetry=False)
+            except Exception:
+                pass
+
+        return Chroma(**kwargs)
+
+    @staticmethod
+    def _is_recoverable_chroma_config_error(error: Exception) -> bool:
+        for candidate in ContractVectorStore._iter_exception_chain(error):
+            if isinstance(candidate, KeyError):
+                missing_key = str(candidate).strip("'\"")
+                if missing_key == "_type":
+                    return True
+
+            text = f"{type(candidate).__name__}: {candidate}".lower()
+            if "collectionconfigurationinternal" in text and "from json" in text:
+                return True
+            if "trying to instantiate configuration" in text:
+                return True
+
+        return False
+
+    @staticmethod
+    def _iter_exception_chain(error: Exception):
+        seen: set[int] = set()
+        current: Exception | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            yield current
+            next_error = current.__cause__ or current.__context__
+            current = next_error if isinstance(next_error, Exception) else None
+
+    def _quarantine_persist_directory(self) -> None:
+        if not self.persist_directory.exists():
+            return
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup_dir = self.persist_directory.with_name(f"{self.persist_directory.name}_corrupt_{timestamp}")
+
+        try:
+            self.persist_directory.replace(backup_dir)
+            logger.warning(
+                "Moved incompatible Chroma directory from %s to %s.",
+                self.persist_directory,
+                backup_dir,
+            )
+        except Exception:
+            shutil.rmtree(self.persist_directory, ignore_errors=True)
+            logger.exception(
+                "Failed to rename incompatible Chroma directory at %s; deleted directory instead.",
+                self.persist_directory,
+            )
 
     def index_chunks(self, chunks: list[dict[str, Any]]) -> int:
         if not chunks:

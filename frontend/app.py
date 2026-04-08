@@ -42,7 +42,7 @@ def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         f"{API_BASE_URL}{path}",
         json=payload,
         headers=_request_headers(),
-        timeout=120,
+        timeout=180,
     )
     response.raise_for_status()
     return response.json()
@@ -104,6 +104,12 @@ def _refresh_contracts(chat_id: str) -> None:
         }
         if active_contract and active_contract not in available_contract_ids:
             st.session_state.chat_active_contract[chat_id] = None
+
+        # Default to the most recently listed contract when one exists.
+        if contracts and not st.session_state.chat_active_contract.get(chat_id):
+            latest_contract_id = str(contracts[-1].get("contract_id", "")).strip()
+            if latest_contract_id:
+                st.session_state.chat_active_contract[chat_id] = latest_contract_id
     except Exception:
         st.session_state.chat_contracts[chat_id] = []
 
@@ -162,19 +168,20 @@ with st.sidebar:
         contracts = st.session_state.chat_contracts.get(current_chat_id, [])
         if contracts:
             contracts_by_id = {str(item.get("contract_id")): item for item in contracts if item.get("contract_id")}
-            scope_options = ["__all_contracts__"] + list(contracts_by_id.keys())
-            current_scope = st.session_state.chat_active_contract.get(current_chat_id) or "__all_contracts__"
+            scope_options = list(contracts_by_id.keys())
+            current_scope = st.session_state.chat_active_contract.get(current_chat_id)
             if current_scope not in scope_options:
-                current_scope = "__all_contracts__"
+                current_scope = scope_options[-1]
+                st.session_state.chat_active_contract[current_chat_id] = current_scope
             
             selected_scope = st.selectbox(
                 "Active Contract:",
                 options=scope_options,
                 index=scope_options.index(current_scope),
                 key=f"scope_{current_chat_id}",
-                format_func=lambda item: "All contracts in this chat" if item == "__all_contracts__" else f"{contracts_by_id.get(item, {}).get('display_name', item)}"
+                format_func=lambda item: f"{contracts_by_id.get(item, {}).get('display_name', item)}"
             )
-            st.session_state.chat_active_contract[current_chat_id] = None if selected_scope == "__all_contracts__" else selected_scope
+            st.session_state.chat_active_contract[current_chat_id] = selected_scope
 
 st.title("Contract Analyzer")
 
@@ -213,9 +220,15 @@ if query:
     st.session_state.sessions[st.session_state.current_session_id].append({"role": "user", "content": query})
     with st.spinner("Analyzing contract..."):
         try:
+            active_contract_id = st.session_state.chat_active_contract.get(st.session_state.current_session_id)
+            if not active_contract_id:
+                current_contracts = st.session_state.chat_contracts.get(st.session_state.current_session_id, [])
+                if current_contracts:
+                    active_contract_id = str(current_contracts[-1].get("contract_id", "")).strip() or None
+
             payload = {
                 "question": query,
-                "contract_id": st.session_state.chat_active_contract.get(st.session_state.current_session_id),
+                "contract_id": active_contract_id,
                 "chat_id": st.session_state.current_session_id,
             }
             result = _post_json("/ask", payload)

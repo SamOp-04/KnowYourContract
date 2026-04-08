@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -9,6 +10,15 @@ from fastapi.concurrency import run_in_threadpool
 
 
 logger = logging.getLogger(__name__)
+
+
+def _pipeline_query_timeout_seconds() -> float:
+    raw_value = os.getenv("PIPELINE_QUERY_TIMEOUT_SECONDS", "90").strip()
+    try:
+        value = float(raw_value)
+    except Exception:
+        return 90.0
+    return value if value > 0 else 0.0
 
 
 def _strict_scope_enabled() -> bool:
@@ -75,13 +85,20 @@ async def run_pipeline_query(
             raise HTTPException(status_code=403, detail="Contract is not accessible from this chat.")
 
     try:
-        return await run_in_threadpool(
+        timeout_seconds = _pipeline_query_timeout_seconds()
+        query_call = run_in_threadpool(
             pipeline.ask,
             query,
             contract_id,
             ground_truth,
             allowed_contract_ids,
         )
+        if timeout_seconds <= 0:
+            return await query_call
+        return await asyncio.wait_for(query_call, timeout=timeout_seconds)
+    except asyncio.TimeoutError as error:
+        logger.warning("Pipeline query timed out after %.1f seconds", _pipeline_query_timeout_seconds())
+        raise HTTPException(status_code=504, detail="Pipeline query timed out.") from error
     except Exception as error:
         logger.exception("Pipeline query failed")
         raise HTTPException(status_code=500, detail="Pipeline query failed.") from error

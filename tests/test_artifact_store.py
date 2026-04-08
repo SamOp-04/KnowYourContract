@@ -188,3 +188,45 @@ def test_vector_store_refreshes_when_artifact_revision_changes(tmp_path, monkeyp
     assert set(local_store.docs.keys()) == {"contract_z_0", "contract_z_1"}
     assert local_store.docs["contract_z_0"][0] == "Updated chunk text."
     assert local_store.docs["contract_z_1"][0] == "Newly added chunk."
+
+
+def test_vector_store_resets_incompatible_chroma_state(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        pipeline_embedder,
+        "resolve_embeddings",
+        lambda model_name: get_hash_embeddings(),
+    )
+
+    persist_dir = tmp_path / "chroma_broken"
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    marker = persist_dir / "marker.txt"
+    marker.write_text("stale", encoding="utf-8")
+
+    class _FlakyChroma:
+        calls = 0
+
+        def __init__(self, **kwargs) -> None:
+            _ = kwargs
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise KeyError("_type")
+
+        def get(self, include=None):
+            _ = include
+            return {"ids": []}
+
+    monkeypatch.setattr(pipeline_embedder, "Chroma", _FlakyChroma)
+
+    vector_store = pipeline_embedder.ContractVectorStore(
+        persist_directory=persist_dir,
+        collection_name="contracts_recover",
+        artifact_store=None,
+    )
+
+    store = vector_store.get_store()
+    assert isinstance(store, _FlakyChroma)
+    assert _FlakyChroma.calls == 2
+
+    backups = list(tmp_path.glob("chroma_broken_corrupt_*"))
+    assert backups
+    assert (backups[0] / "marker.txt").exists()
